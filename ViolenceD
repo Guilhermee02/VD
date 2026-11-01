@@ -1,6 +1,5 @@
--- swangy: reduced build
--- retained: generator ESP, bear-trap ESP, automatic skill checks, and HUD
--- removed: window/pallet/pumpkin ESP, aim assist, parry automation, menu, and keybind overlay
+-- swangy: generator ESP, bear-trap ESP, and auto skill check
+-- Matcha is the only control panel; the in-game floating HUD is removed.
 
 if _G.__SWANGY and _G.__SWANGY.unload then pcall(_G.__SWANGY.unload) end
 
@@ -97,7 +96,7 @@ if not resolveCore() then
 end
 pcall(function() mouse = lp:GetMouse() end)
 
--- Kept features: Generator ESP, Bear Trap ESP, automatic skill checks, and HUD.
+-- Kept features: Generator ESP, Bear Trap ESP, and automatic skill checks.
 local CFG = {
     drawHz = 0,
     pollHz = 2,
@@ -140,19 +139,10 @@ local CFG = {
     scDry = false,
     scMode = nil,
 
-    hud = true,
-    hudAlpha = 0,
-    hudAbilities = true,
-    hudPerks = true,
-    hudGens = true,
-    hudSurvivors = true,
-    hudTraps = true,
-    hudState = false,
 }
 
--- UI was removed; HUD uses its built-in fallback colors.
-local UI, uiWindow = nil, nil
-local HUD = {}
+-- Matcha provides the controls; no separate on-screen HUD is created.
+local UI = nil
 
 local COL = {
     genIdle = Color3.fromRGB(26, 255, 51),
@@ -611,7 +601,6 @@ local function updateGenStates(list)
             local okc, crew = pcall(function() return t.model:GetAttribute("PlayersRepairingCount") end)
             if okp and type(prog) == "number" then
                 t.prog = prog
-                if HUD.genRate then HUD.genRate(t, prog, now) end
             end
             if okc and type(crew) == "number" then t.crew = crew end
             if now >= (t.stateAt or 0) then
@@ -1525,7 +1514,7 @@ local function refreshWorld()
         genGeo = {}
     end
 
-    if not (CFG.gen or (CFG.hud and CFG.hudGens)) then
+    if not CFG.gen then
         genList = {}
     elseif not (genList[1] and stamp == genDiscoverStamp and os.clock() < genDiscoverAt) then
         genDiscoverStamp, genDiscoverAt = stamp, os.clock() + 30
@@ -1614,7 +1603,7 @@ end)
 local genPollHz = 10
 task.spawn(function()
     while running and _G.__SWANGY_LOAD == loadToken do
-        if (CFG.gen or (CFG.hud and CFG.hudGens)) and genList[1] then
+        if CFG.gen and genList[1] then
             pcall(updateGenStates, genList)
         end
         task.wait(1 / genPollHz)
@@ -1623,7 +1612,7 @@ end)
 
 task.spawn(function()
     while running and _G.__SWANGY_LOAD == loadToken do
-        if CFG.trap or (CFG.hud and CFG.hudTraps) then
+        if CFG.trap then
             local ok, list = pcall(collectTraps)
             if ok and list then
                 ensureSlots(trapPool, math.min(#list, CFG.trapPool), CFG.trapThick, CFG.trapText)
@@ -1694,7 +1683,7 @@ function API.unload()
     if not running then return end
     running = false
     scReleaseInput()
-    if HUD.destroy then pcall(HUD.destroy) end
+    if API.matchaCleanup then pcall(API.matchaCleanup) end
     if connection then pcall(function() connection:Disconnect() end); connection = nil end
     for i = 1, #genPool do removeSlot(genPool[i]) end
     for i = 1, #trapPool do removeSlot(trapPool[i]) end
@@ -1703,1171 +1692,160 @@ function API.unload()
 end
 API.stop = API.unload
 
--- hud: killer timers, generators, survivors
-HUD.lines, HUD.rows, HUD.count = {}, {}, 0
-HUD.k = { attrs = {} }
-HUD.order, HUD.perkList, HUD.cat = {}, {}, nil
-HUD.perkSlots, HUD.perkUnknown = 0, 0
-HUD.surv = {}
-HUD.seed = { chunk = 1, cursor = 0, live = nil, forChar = nil }
-HUD.survLive = { "Knocked", "IsHooked", "IsCarried" }
-HUD.x, HUD.y, HUD.w = nil, nil, 262
-HUD.drag, HUD.wasDown, HUD.shown = nil, false, false
-HUD.lastPoll, HUD.lastDraw, HUD.lastFind = 0, 0, 0
-HUD.findAt, HUD.perkAt, HUD.scanAt, HUD.survPollAt = 0, 0, 0, 0
-HUD.genNext, HUD.lastError = 0, nil
-HUD.pollMs, HUD.drawMs = 0, 0
-HUD.cReady = Color3.fromRGB(80, 255, 120)
-HUD.cCool = Color3.fromRGB(255, 170, 60)
-HUD.cWarn = Color3.fromRGB(255, 110, 110)
-HUD.cDim = Color3.fromRGB(170, 170, 170)
-HUD.cText = Color3.fromRGB(230, 230, 230)
-HUD.cTitle = Color3.fromRGB(255, 255, 255)
 
-HUD.abilities = {
-    Slasher = {
-        { attr = "LakeMist", label = "Invis", active = 13, cooldown = 60 },
-        { attr = "Pursuit", label = "Rage", active = 20, cooldown = 80 },
-    },
-    Veil = {
-        { attr = "Spears", label = "Spears", counter = true, recharge = 15 },
-        { attr = "special", label = "Charge", readyFlag = true, cooldown = 30 },
-    },
-}
-
-HUD.plain = {
-    BloodLust = true, IsStunned = true, Immobile = true,
-    IsCarrying = true, IsChasing = true, spearmode = true,
-}
-
-HUD.always = { BloodLust = true, TerrorRadius = true }
-
-HUD.skip = {
-    ChaseTargetUserId = true, CarriedSurvivorId = true, Chasemusic = true,
-    Suspense = true, ITEMINDEX = true, SuspenseRadius = true,
-    nostun = true, overridelookscript = true, speedboost = true,
-    swift = true, breakspeed = true,
-}
-
-HUD.baseline = {
-    HookCount = true, HookedProgress = true, Knocked = true,
-    speedboost = true, skillcheckspeed = true, IsRunning = true,
-    Iframes = true, repairboost = true, healboost = true,
-    unhookspeed = true, healnerf = true, bleedboost = true,
-    vaultspeed = true, skillcheckfrequency = true, Sprinting = true,
-    IsChased = true, chasereward = true, ChaseCount = true,
-    repairing = true, Parry = true, RemainingCarryTime = true,
-    HookProgressDepleting = true, HealProgress = true, Crouching = true,
-    Crouchingserver = true, HealingPaused = true, isvaulting = true,
-    vaultending = true, Untargettable = true, anticamp = true,
-    IsCarried = true, nogui = true, IsHooked = true,
-    overridelookscript = true, __VaultFireCount = true,
-}
-
-HUD.engine = {
-    MaterialSounds = true, cutscene = true, Sound = true,
-    ["Camera resetter"] = true, Animate = true, Lookscript = true,
-    R6RagdollClient = true, Health = true, ["Animations-new"] = true,
-    CheckInterractable = true, ["Skillcheck-gen"] = true,
-    ["Skillcheck-player"] = true, ["Highlight-forsurvivor"] = true,
-    heartbeat = true, Audioinit = true, SmoothCamera = true,
-    ProgressBar = true, Lock = true, Firstperson = true, VMscript = true,
-    carriedtransparency = true, Animations = true, voicemanager = true,
-    ["Left Arm"] = true, ["Left Leg"] = true, ["Right Arm"] = true,
-    ["Right Leg"] = true, Instinct = true, Killerost = true,
-}
-
-HUD.seed.fallback = {
-    "special", "Spears", "spearmode", "BloodLust",
-    "IsStunned", "Immobile", "IsCarrying",
-}
-
-HUD.genRate = function(t, prog, now)
-    local base, at = t.hudBase, t.hudBaseAt
-    if base and prog < base then
-        t.hudRate, t.hudEta, t.hudEtaAt = nil, nil, nil
-        t.hudBase, t.hudBaseAt = prog, now
-        return
-    end
-    if not at then
-        t.hudBase, t.hudBaseAt = prog, now
-        return
-    end
-    if now - at >= 3 then
-        local gained = prog - base
-        if gained > 0 then
-            local r = gained / (now - at)
-            t.hudRate = t.hudRate and (t.hudRate * 0.5 + r * 0.5) or r
-        elseif gained == 0 then
-            t.hudRate = nil
+-- Matcha UI: the only control surface for the retained features.
+-- Uses the documented UI.AddTab / Section / Toggle / SliderInt API.
+local function buildMatchaUI()
+    local M = _G.UI
+    if type(M) ~= "table" or type(M.AddTab) ~= "function" then
+        if type(warn) == "function" then
+            warn("[swangy] Matcha UI API unavailable; feature loops remain idle until toggled by API")
         end
-        t.hudBase, t.hudBaseAt = prog, now
-    end
-end
-
-HUD.eta = function(t, now)
-    local r = t.hudRate
-    if not r or r <= 0.01 then
-        t.hudEta, t.hudEtaAt = nil, nil
-        return nil
-    end
-    local measured = (100 - (t.prog or 0)) / r
-    if measured < 0 then measured = 0 end
-    local shown = t.hudEta and (t.hudEta - (now - (t.hudEtaAt or now))) or nil
-    if not shown or shown < 0 or math.abs(shown - measured) > 4 then
-        t.hudEta, t.hudEtaAt = measured, now
-        shown = measured
-    end
-    if shown < 0 then shown = 0 end
-    return shown
-end
-
-HUD.where = function()
-    local ch = lp.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        local ok, p = pcall(function() return hrp.Position end)
-        if ok and p then return p.X, p.Y, p.Z end
-    end
-    local cam = Workspace.CurrentCamera
-    if cam then
-        local ok, cf = pcall(function() return cam.CFrame end)
-        if ok and cf then return cf.Position.X, cf.Position.Y, cf.Position.Z end
-    end
-    return 0, 0, 0
-end
-
-HUD.learned = function(rec)
-    local n = #rec.durations
-    if n == 0 then return nil end
-    local sorted = {}
-    for i = 1, n do sorted[i] = rec.durations[i] end
-    table.sort(sorted)
-    local median = sorted[math.floor((n + 1) / 2)]
-    return median, sorted[1], sorted[n], n
-end
-
-HUD.trackAttr = function(name, value, now)
-    local rec = HUD.k.attrs[name]
-    if not rec then
-        rec = { value = value, since = now, durations = {}, peak = nil }
-        if type(value) == "number" then rec.peak = value end
-        HUD.k.attrs[name] = rec
-        HUD.order[#HUD.order + 1] = name
-        return
-    end
-    if type(value) == "number" and (rec.peak == nil or value > rec.peak) then
-        rec.peak = value
-    end
-    if rec.value == value then return end
-    local prev = rec.value
-    rec.value = value
-    rec.since = now
-    rec.changes = (rec.changes or 0) + 1
-    if HUD.plain[name] then return end
-    local spent = (prev == true and value == false)
-        or (type(value) == "number" and type(prev) == "number" and value < prev)
-    local restored = (prev == false and value == true)
-        or (type(value) == "number" and type(prev) == "number" and value > prev)
-    if spent then
-        rec.downAt = now
-    elseif restored and rec.downAt then
-        local d = now - rec.downAt
-        rec.downAt = nil
-        if d > 0.2 and d < 300 then
-            rec.durations[#rec.durations + 1] = d
-            if #rec.durations > 12 then table.remove(rec.durations, 1) end
-            rec.lastDuration = d
-        end
-    end
-end
-
-HUD.trackAbility = function(spec, value, now)
-    local rec = HUD.k.attrs[spec.attr]
-    if not rec then
-        rec = { value = value, since = now, durations = {}, spec = spec }
-        if type(value) == "number" then rec.peak = value end
-        HUD.k.attrs[spec.attr] = rec
-        HUD.order[#HUD.order + 1] = spec.attr
-        return
-    end
-    rec.spec = spec
-    if type(value) == "number" and (rec.peak == nil or value > rec.peak) then
-        rec.peak = value
-    end
-    if rec.value == value then return end
-    local prev = rec.value
-    rec.value = value
-    rec.since = now
-
-    if spec.counter then
-        if type(value) == "number" and type(prev) == "number" then
-            if value < prev then
-                rec.downAt = now
-            elseif value > prev then
-                if rec.downAt then
-                    local d = now - rec.downAt
-                    if d > 0.2 and d < 300 then
-                        rec.durations[#rec.durations + 1] = d
-                        if #rec.durations > 12 then table.remove(rec.durations, 1) end
-                    end
-                end
-                if rec.peak and value < rec.peak then
-                    rec.downAt = now
-                else
-                    rec.downAt = nil
-                end
-            end
-        end
-        return
-    end
-
-    if spec.readyFlag then
-        if prev == true and value == false then
-            rec.activeUntil = nil
-            if spec.cooldown then
-                rec.readyAt = now + spec.cooldown
-            else
-                rec.downAt = now
-            end
-        elseif prev == false and value == true then
-            rec.readyAt = nil
-            rec.downAt = nil
-        end
-        return
-    end
-
-    if prev == false and value == true then
-        rec.activeUntil = spec.active and (now + spec.active) or nil
-        rec.readyAt = nil
-        rec.downAt = nil
-    elseif prev == true and value == false then
-        rec.activeUntil = nil
-        if spec.cooldown then
-            rec.readyAt = now + spec.cooldown
-        else
-            rec.downAt = now
-        end
-    end
-end
-
-HUD.seedNames = function(char, now)
-    if HUD.seed.forChar == char and HUD.seed.live
-            and (now or 0) - (HUD.seed.readAt or 0) < 10 then
-        return HUD.seed.live
-    end
-    local previous = (HUD.seed.forChar == char) and HUD.seed.live or nil
-    HUD.seed.readAt = now or 0
-    HUD.seed.forChar = char
-    local ok, names = pcall(function() return char:GetAttributes() end)
-    local list = {}
-    if ok and type(names) == "table" then
-        for _, n in pairs(names) do
-            if type(n) == "string" and not HUD.skip[n] then
-                list[#list + 1] = n
-            end
-        end
-        table.sort(list)
-    end
-    if #list == 0 then
-        for i = 1, #HUD.seed.fallback do list[i] = HUD.seed.fallback[i] end
-    end
-    if previous then
-        local have = {}
-        for i = 1, #list do have[list[i]] = true end
-        for i = 1, #previous do
-            if not have[previous[i]] then list[#list + 1] = previous[i] end
-        end
-        table.sort(list)
-    end
-    HUD.seed.live = list
-    return list
-end
-
-HUD.findKiller = function(now)
-    local K = HUD.k
-    local ch = K.char
-    if ch then
-        local ok, live = pcall(function() return ch.Parent ~= nil end)
-        if ok and live then
-            if now - (HUD.perkAt or 0) > 10 then
-                HUD.perkAt = now
-                pcall(HUD.readPerks, ch)
-            end
-            return ch
-        end
-    end
-    if now - HUD.lastFind < 2 then return nil end
-    HUD.lastFind = now
-    K.player, K.char, K.type = nil, nil, nil
-    local okP, players = pcall(function() return Players:GetPlayers() end)
-    if not okP or type(players) ~= "table" then players = {} end
-    for _, plr in ipairs(players) do
-        local ok, team = pcall(function() return plr.Team and plr.Team.Name end)
-        if ok and team == "Killer" then
-            K.player = plr
-            K.char = plr.Character
-            local okK, k = pcall(function() return plr:GetAttribute("SelectedKiller") end)
-            K.type = okK and k or nil
-            HUD.readPerks(K.char)
-            break
-        end
-    end
-    return K.char
-end
-
-HUD.pollKiller = function(now)
-    local K = HUD.k
-    local char = K.char
-    if not char or (now - (HUD.findAt or 0)) >= 1 then
-        HUD.findAt = now
-        char = HUD.findKiller(now)
-    end
-    if not char then
-        if #HUD.order > 0 then K.attrs, HUD.order = {}, {} end
-        return
-    end
-
-    local known = K.type and HUD.abilities[K.type]
-
-    if known then
-        HUD.specCursor = (HUD.specCursor or 0) % #known + 1
-        local spec = known[HUD.specCursor]
-        local ok, v = pcall(function() return char:GetAttribute(spec.attr) end)
-        if ok and v ~= nil and type(v) ~= "table" then
-            HUD.trackAbility(spec, v, now)
-        end
-    end
-
-    if known and now - (HUD.seedAt or 0) < 0.5 then return end
-    HUD.seedAt = now
-
-    local specFor = nil
-    if known then
-        specFor = {}
-        for i = 1, #known do specFor[known[i].attr] = known[i] end
-    end
-
-    local names = HUD.seedNames(char, now)
-    local n = #names
-    if n == 0 then return end
-    HUD.seed.cursor = HUD.seed.cursor % n + 1
-    local name = names[HUD.seed.cursor]
-    local ok, v = pcall(function() return char:GetAttribute(name) end)
-    if ok and v ~= nil and type(v) ~= "table" then
-        local spec = specFor and specFor[name]
-        if spec then
-            HUD.trackAbility(spec, v, now)
-        else
-            HUD.trackAttr(name, v, now)
-        end
-    end
-end
-
-HUD.perkNameFor = function(attr)
-    if not HUD.cat then
-        HUD.cat = {}
-        local okF, folder = pcall(function()
-            return game:GetService("ReplicatedStorage"):FindFirstChild("Perks")
-        end)
-        if okF and folder then
-            local ok, kids = pcall(function() return folder:GetChildren() end)
-            if ok and type(kids) == "table" then
-                for i = 1, #kids do
-                    local display = kids[i].Name
-                    HUD.cat[lower(display):gsub("[^%a]", "")] = display
-                end
-            end
-        end
-    end
-    local key = lower(attr):gsub("[^%a]", "")
-    if HUD.cat[key] then return HUD.cat[key] end
-    for k, display in pairs(HUD.cat) do
-        if #k >= 6 and key:sub(1, #k) == k then return display end
-    end
-    return nil
-end
-
-HUD.readPerks = function(char)
-    HUD.perkList = {}
-    HUD.perkSlots, HUD.perkUnknown = 0, 0
-    if not char then return end
-    local ok, kids = pcall(function() return char:GetChildren() end)
-    if not ok then return end
-
-    local slots = 0
-    for i = 1, #kids do
-        local c = kids[i]
-        if c.ClassName == "Script" or c.ClassName == "LocalScript" then
-            local named = string.match(tostring(c.Name), "^(.-)%s+%d+$")
-            local tierOnly = tonumber(c.Name) ~= nil
-            if named and named ~= "" then
-                slots = slots + 1
-                HUD.perkList[#HUD.perkList + 1] = named
-            elseif tierOnly then
-                slots = slots + 1
-            end
-        end
-    end
-
-    local okA, names = pcall(function() return char:GetAttributes() end)
-    if okA and type(names) == "table" then
-        local seen = {}
-        for i = 1, #HUD.perkList do seen[HUD.perkList[i]] = true end
-        for _, n in pairs(names) do
-            if type(n) == "string" and not HUD.baseline[n] then
-                local display = HUD.perkNameFor(n)
-                if display and not seen[display] then
-                    seen[display] = true
-                    HUD.perkList[#HUD.perkList + 1] = display
-                end
-            end
-        end
-    end
-
-    HUD.perkSlots = slots
-    HUD.perkUnknown = slots - #HUD.perkList
-    if HUD.perkUnknown < 0 then HUD.perkUnknown = 0 end
-end
-
-HUD.scanSurvivor = function(plr)
-    local char = plr.Character
-    if not char then return nil end
-    local e = { player = plr, name = plr.Name, char = char, perks = {}, state = {} }
-
-    local okI, item = pcall(function() return plr:GetAttribute("EquippedItem") end)
-    e.item = (okI and item) and tostring(item) or nil
-
-    local ok, kids = pcall(function() return char:GetChildren() end)
-    if ok and type(kids) == "table" then
-        for i = 1, #kids do
-            local c = kids[i]
-            if c.ClassName == "Model" and c.Name ~= "Weapon" then
-                e.item = c.Name
-                break
-            end
-        end
-    end
-
-    local okN, names = pcall(function() return char:GetAttributes() end)
-    if okN and type(names) == "table" then
-        local seen = {}
-        for _, n in pairs(names) do
-            if type(n) == "string" and not HUD.baseline[n] then
-                local display = HUD.perkNameFor(n)
-                if display and not seen[display] then
-                    seen[display] = true
-                    e.perks[#e.perks + 1] = display
-                end
-            end
-        end
-    end
-
-    local scripts = 0
-    if ok and type(kids) == "table" then
-        for i = 1, #kids do
-            local c = kids[i]
-            if (c.ClassName == "Script" or c.ClassName == "LocalScript")
-                    and not HUD.engine[c.Name] then
-                scripts = scripts + 1
-            end
-        end
-    end
-    e.perkScripts = scripts
-    e.unknownPerks = scripts - #e.perks
-    if e.unknownPerks < 0 then e.unknownPerks = 0 end
-    return e
-end
-
-HUD.rescanSurvivors = function()
-    HUD.surv = {}
-    local okP, players = pcall(function() return Players:GetPlayers() end)
-    if not okP or type(players) ~= "table" then players = {} end
-    for _, plr in ipairs(players) do
-        local ok, team = pcall(function() return plr.Team and plr.Team.Name end)
-        if ok and team == "Survivors" then
-            local e = HUD.scanSurvivor(plr)
-            if e then HUD.surv[#HUD.surv + 1] = e end
-        end
-    end
-end
-
-HUD.pollSurvivors = function(now)
-    for i = 1, #HUD.surv do
-        local e = HUD.surv[i]
-        local char = e.char
-        if char then
-            local okLive, live = pcall(function() return char.Parent ~= nil end)
-            if okLive and live then
-                for j = 1, #HUD.survLive do
-                    local key = HUD.survLive[j]
-                    local ok, v = pcall(function() return char:GetAttribute(key) end)
-                    if ok then e.state[key] = v end
-                end
-            end
-        end
-    end
-end
-
-HUD.isKillerCached, HUD.isKillerAt = false, -100
-
-HUD.localIsKiller = function()
-    local now = os.clock()
-    if now - HUD.isKillerAt < 2 then return HUD.isKillerCached end
-    HUD.isKillerAt = now
-    local team = nil
-    pcall(function() team = lp.Team and lp.Team.Name end)
-    HUD.isKillerCached = team == "Killer"
-    return HUD.isKillerCached
-end
-
-HUD.renderGens = function(put, now)
-    put("GENERATORS", HUD.cTitle)
-    if #genList == 0 then
-        put("  none", HUD.cDim)
-        return
-    end
-    local px, py, pz = HUD.where()
-    local list = {}
-    for i = 1, #genList do
-        local t = genList[i]
-        if not t.hudId then
-            HUD.genNext = HUD.genNext + 1
-            t.hudId = HUD.genNext
-        end
-        if t.pos then
-            local dx, dy, dz = t.pos.X - px, t.pos.Y - py, t.pos.Z - pz
-            t.hudDist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz) + 0.5)
-        else
-            t.hudDist = 0
-        end
-        list[i] = t
-    end
-    table.sort(list, function(a, b)
-        local pa, pb = math.floor(a.prog or 0), math.floor(b.prog or 0)
-        if pa ~= pb then return pa > pb end
-        if (a.hudDist or 0) ~= (b.hudDist or 0) then return (a.hudDist or 0) < (b.hudDist or 0) end
-        return (a.hudId or 0) < (b.hudId or 0)
-    end)
-
-    for i = 1, #list do
-        local t = list[i]
-        local prog = math.floor(t.prog or 0)
-        local crew = t.crew or 0
-        local txt = string.format("%3d%%  %4dm", prog, t.hudDist or 0)
-        if crew > 0 then txt = txt .. "  x" .. crew end
-        local colour = HUD.cDim
-        if prog >= 100 then
-            colour = HUD.cReady
-            txt = txt .. "  done"
-        elseif t.state == "paused" then
-            colour = HUD.cCool
-        elseif crew > 0 then
-            colour = HUD.cCool
-            local left = HUD.eta(t, now)
-            if left then txt = txt .. string.format("  %ds", math.floor(left + 0.5)) end
-        elseif t.state == "regress" then
-            colour = HUD.cWarn
-        end
-        put("  " .. txt, colour)
-    end
-end
-
-HUD.renderTraps = function(put)
-    put("BEAR TRAPS", HUD.cTitle)
-    if #trapList == 0 then
-        put("  none", HUD.cDim)
-        return
-    end
-    local px, py, pz = HUD.where()
-    local list = {}
-    for i = 1, #trapList do
-        local t = trapList[i]
-        local dx, dy, dz = t.pos.X - px, t.pos.Y - py, t.pos.Z - pz
-        t.hudDist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz) + 0.5)
-        list[i] = t
-    end
-    table.sort(list, function(a, b)
-        if a.hudDist ~= b.hudDist then return a.hudDist < b.hudDist end
-        return (a.id or 0) < (b.id or 0)
-    end)
-    for i = 1, #list do
-        local t = list[i]
-        put("  " .. trapLabel(t, t.hudDist),
-            (t.armed == false) and HUD.cWarn or HUD.cReady)
-    end
-end
-
-HUD.renderSurvivors = function(put)
-    put("SURVIVORS", HUD.cTitle)
-    if #HUD.surv == 0 then
-        put("  none", HUD.cDim)
-        return
-    end
-    for i = 1, #HUD.surv do
-        local e = HUD.surv[i]
-        local st = e.state
-        local tag, colour
-        if st.IsHooked == true then
-            tag, colour = "hooked", HUD.cReady
-        elseif st.IsCarried == true then
-            tag, colour = "carried", HUD.cReady
-        elseif st.Knocked == true then
-            tag, colour = "downed", HUD.cWarn
-        else
-            tag, colour = nil, HUD.cText
-        end
-        local head = e.name
-        if e.item then head = head .. "  " .. e.item end
-        if tag then head = head .. "  [" .. tag .. "]" end
-        put(head, colour)
-        if CFG.hudPerks then
-            for j = 1, #e.perks do put("  " .. e.perks[j], HUD.cDim) end
-            if (e.unknownPerks or 0) > 0 then
-                put("  +" .. e.unknownPerks .. " unidentified", HUD.cDim)
-            end
-        end
-    end
-end
-
--- `...Until` attributes are absolute deadlines, but the game does not put them
--- all on one clock: Veil writes epoch seconds (os.time) while AC_* writes
--- os.clock seconds. Take whichever clock puts the deadline inside a believable
--- window, and fall back to the raw number when neither does (a counter, a flag
--- or a clock this build has not met yet).
-HUD.untilLeft = function(name, value, now)
-    if type(name) ~= "string" or name:sub(-5) ~= "Until" then return nil end
-    if type(value) ~= "number" or value ~= value or value == math.huge then return nil end
-    if value <= 0 then return 0 end
-    local epoch = os.time()
-    -- epoch seconds (and milliseconds) are unmistakable, so a long cooldown still
-    -- reads out; everything else must land near a clock we can actually read, so
-    -- a plain counter is never mistaken for a deadline
-    if value > 1e12 then return value / 1000 - epoch end
-    if value > 1e9 then return value - epoch end
-    local left = value - now
-    if left >= -3600 and left <= 3600 then return left end
-    left = value / 1000 - now
-    if left >= -3600 and left <= 3600 then return left end
-    return nil
-end
-
-HUD.build = function(now)
-    local L = HUD.lines
-    local n = 0
-    local function put(t, c)
-        if n >= 44 then return end
-        n = n + 1
-        local e = L[n]
-        if not e then e = {} L[n] = e end
-        local s = tostring(t)
-        if #s > 34 then s = s:sub(1, 32) .. ".." end
-        e.t, e.c = s, c or HUD.cText
-    end
-
-    local K = HUD.k
-    if K.char then
-        put("KILLER  " .. tostring(K.type or "?")
-            .. (K.player and ("  " .. K.player.Name) or ""), HUD.cTitle)
-    else
-        put("KILLER  not found", HUD.cDim)
-    end
-
-    if CFG.hudAbilities then
-        for i = 1, #HUD.order do
-            local name = HUD.order[i]
-            local rec = K.attrs[name]
-            local worth = (rec and rec.changes and rec.changes > 0)
-                or HUD.always[name] or (rec and rec.spec ~= nil)
-            if rec and worth and (CFG.hudState or not HUD.plain[name]) then
-                local label, colour
-                if HUD.plain[name] then
-                    local v = rec.value
-                    if v == true then
-                        label, colour = name .. ": yes", HUD.cWarn
-                    elseif v == false then
-                        label, colour = name .. ": no", HUD.cDim
-                    else
-                        label = name .. ": " .. tostring(v)
-                        colour = (type(v) == "number" and v > 0) and HUD.cWarn or HUD.cDim
-                    end
-                elseif rec.spec and rec.spec.counter then
-                    local shown = rec.spec.label or name
-                    local count = tostring(rec.value)
-                        .. (rec.peak and ("/" .. tostring(rec.peak)) or "")
-                    if rec.downAt then
-                        local elapsed = now - rec.downAt
-                        local median = rec.spec.recharge or HUD.learned(rec)
-                        if median then
-                            local left = median - elapsed
-                            if left < 0 then left = 0 end
-                            label = string.format("%s   %s   %.0fs", shown, count, left)
-                        else
-                            label = string.format("%s   %s   %.0fs", shown, count, elapsed)
-                        end
-                        colour = HUD.cCool
-                    else
-                        label = string.format("%s   %s", shown, count)
-                        colour = HUD.cReady
-                    end
-                elseif rec.activeUntil then
-                    local left = rec.activeUntil - now
-                    if left <= 0 then
-                        rec.activeUntil = nil
-                        label = (rec.spec and rec.spec.label or name) .. "   active"
-                        colour = HUD.cWarn
-                    else
-                        label = string.format("%s   ACTIVE %.1fs",
-                            rec.spec and rec.spec.label or name, left)
-                        colour = HUD.cWarn
-                    end
-                elseif rec.readyAt then
-                    local left = rec.readyAt - now
-                    if left <= 0 then
-                        rec.readyAt = nil
-                        label = (rec.spec and rec.spec.label or name) .. "   ready"
-                        colour = HUD.cReady
-                    else
-                        label = string.format("%s   %.0fs",
-                            rec.spec and rec.spec.label or name, left)
-                        colour = HUD.cCool
-                    end
-                elseif rec.downAt then
-                    local elapsed = now - rec.downAt
-                    local median = HUD.learned(rec)
-                    local shown = rec.spec and rec.spec.label or name
-                    if median then
-                        local left = median - elapsed
-                        if left < 0 then left = 0 end
-                        label = string.format("%s   %.1fs", shown, left)
-                        colour = HUD.cCool
-                    else
-                        label = string.format("%s   %s", shown, tostring(rec.value))
-                        colour = HUD.cDim
-                    end
-                else
-                    local shown = rec.spec and rec.spec.label or name
-                    if rec.spec and rec.spec.readyFlag and rec.value == false then
-                        label, colour = shown .. "   on cooldown", HUD.cCool
-                    elseif type(rec.value) == "number" then
-                        local left = HUD.untilLeft(name, rec.value, now)
-                        if left then
-                            if left <= 0 then
-                                label, colour = shown .. "   ready", HUD.cReady
-                            elseif left >= 10 then
-                                label, colour = string.format("%s   %.0fs", shown, left), HUD.cCool
-                            else
-                                label, colour = string.format("%s   %.1fs", shown, left), HUD.cCool
-                            end
-                        else
-                            local suffix = ""
-                            if rec.peak and rec.peak ~= rec.value then
-                                suffix = "/" .. tostring(rec.peak)
-                            end
-                            label = shown .. "   " .. tostring(rec.value) .. suffix
-                            colour = HUD.cReady
-                        end
-                    else
-                        label, colour = shown .. "   ready", HUD.cReady
-                    end
-                end
-                put(label, colour)
-            end
-        end
-    end
-
-    if CFG.hudPerks and ((HUD.perkSlots or 0) > 0 or #HUD.perkList > 0) then
-        put("PERKS", HUD.cTitle)
-        for i = 1, #HUD.perkList do
-            put("  " .. HUD.perkList[i], HUD.cDim)
-        end
-        if (HUD.perkUnknown or 0) > 0 then
-            put("  +" .. HUD.perkUnknown .. " unnamed", HUD.cDim)
-        end
-    end
-
-    if CFG.hudGens then
-        put(" ", HUD.cDim)
-        HUD.renderGens(put, now)
-    end
-
-    if CFG.hudTraps then
-        put(" ", HUD.cDim)
-        HUD.renderTraps(put)
-    end
-
-    if CFG.hudSurvivors and HUD.localIsKiller() then
-        put(" ", HUD.cDim)
-        HUD.renderSurvivors(put)
-    end
-
-    for i = n + 1, #L do L[i] = nil end
-    HUD.lineCount = n
-    -- keep every line inside the panel and the rows tall enough for the font
-    local _, glyphH = HUD.measure("Ag")
-    if glyphH > 0 then
-        local pitch = math.max(16, math.ceil(glyphH) + 3)
-        if pitch > 24 then pitch = 24 end
-        if HUD.lineH ~= pitch then HUD.lineH = pitch end
-    end
-    local maxw = HUD.w - 20
-    for i = 1, n do
-        local e = L[i]
-        if #e.t > 0 and HUD.measure(e.t) > maxw then
-            e.t = HUD.fit(e.t, maxw)
-        end
-    end
-end
-
-HUD.obj = function(kind, z)
-    local ok, d = pcall(Drawing.new, kind)
-    if not ok or not d then return nil end
-    pcall(function() d.Visible = false; d.ZIndex = z end)
-    return d
-end
-
--- measure HUD text with its real font so lines are clipped to the panel and
--- the row pitch matches the glyph height (16 px pitch on a 17 px glyph made
--- every line sit on top of the one below it)
-HUD.measure = function(s)
-    local m = HUD.meas
-    if not m then
-        m = HUD.obj("Text", 0)
-        if not m then return 0, 0 end
-        m.Size = 13
-        pcall(function() m.Font = FONT end)
-        HUD.meas = m
-    end
-    m.Text = tostring(s)
-    local b = m.TextBounds
-    return (b and b.X) or (#tostring(s) * 8), (b and b.Y) or 16
-end
-
-HUD.fit = function(s, maxw)
-    s = tostring(s)
-    if maxw <= 8 then return "" end
-    local w = HUD.measure(s)
-    if w <= maxw then return s end
-    while #s > 1 do
-        s = s:sub(1, #s - 1)
-        local cand = s .. ".."
-        if HUD.measure(cand) <= maxw then return cand end
-    end
-    return ""
-end
-
-HUD.hide = function()
-    if not HUD.bg then return end
-    HUD.bg.Visible = false
-    HUD.border.Visible = false
-    HUD.accent.Visible = false
-    HUD.title.Visible = false
-    if HUD.close then HUD.close.Visible = false end
-    for _, r in ipairs(HUD.rows) do r.t.Visible = false end
-    HUD.shown = false
-end
-
-HUD.destroy = function()
-    if HUD.bg then pcall(function() HUD.bg:Remove() end) end
-    if HUD.border then pcall(function() HUD.border:Remove() end) end
-    if HUD.accent then pcall(function() HUD.accent:Remove() end) end
-    if HUD.title then pcall(function() HUD.title:Remove() end) end
-    if HUD.close then pcall(function() HUD.close:Remove() end) end
-    for _, r in ipairs(HUD.rows) do pcall(function() r.t:Remove() end) end
-    if HUD.meas then pcall(function() HUD.meas:Remove() end) HUD.meas = nil end
-    HUD.bg, HUD.border, HUD.accent, HUD.title, HUD.close = nil, nil, nil, nil, nil
-    HUD.rows, HUD.shown, HUD.count = {}, false, 0
-    HUD.gx, HUD.gy, HUD.gw, HUD.gh = nil, nil, nil, nil
-end
-
-HUD.ensure = function()
-    if HUD.bg then return true end
-    local ok = pcall(function()
-        HUD.bg = HUD.obj("Square", 45)
-        HUD.bg.Filled = true
-        HUD.bg.Corner = 4
-        HUD.border = HUD.obj("Square", 46)
-        HUD.border.Filled = false
-        HUD.border.Thickness = 1
-        HUD.border.Corner = 4
-        HUD.accent = HUD.obj("Square", 47)
-        HUD.accent.Filled = true
-        HUD.title = HUD.obj("Text", 48)
-        HUD.title.Text = "HUD"
-        HUD.title.Size = 14
-        HUD.title.Font = FONT
-        HUD.title.Outline = false
-        HUD.title.Transparency = 1
-        HUD.close = HUD.obj("Text", 49)
-        HUD.close.Text = "x"
-        HUD.close.Size = 14
-        HUD.close.Font = FONT
-        HUD.close.Outline = false
-        HUD.close.Transparency = 1
-    end)
-    if not ok or not HUD.bg then
-        HUD.destroy()
         return false
     end
+
+    UI = M
+    local TAB_NAME = "Swangy"
+    local values = {
+        sw_gen = CFG.gen,
+        sw_trap = CFG.trap,
+        sc_on = CFG.sc,
+        sc_rescue = CFG.scRescue,
+        sc_hum = CFG.scHum,
+        sc_hum_min = CFG.scHumMin,
+        sc_hum_max = CFG.scHumMax,
+        sc_react = CFG.scReact,
+        sc_delay = CFG.scDelay,
+        gen_range = CFG.genRange,
+        trap_range = CFG.trapRange,
+        sc_lead = CFG.scLead,
+    }
+
+    local setters = {
+        sw_gen = function(v) API.gen.SetEnabled(v == true) end,
+        sw_trap = function(v) API.trap.SetEnabled(v == true) end,
+        sc_on = function(v) API.sc.SetEnabled(v == true) end,
+        sc_rescue = function(v) API.sc.SetRescue(v == true) end,
+        sc_hum = function(v) CFG.scHum = v == true end,
+        sc_hum_min = function(v)
+            local n = math.clamp(tonumber(v) or CFG.scHumMin, 0, 500)
+            if n > CFG.scHumMax then n = CFG.scHumMax end
+            CFG.scHumMin = n
+            if type(M.SetValue) == "function" then pcall(M.SetValue, "sc_hum_min", n) end
+        end,
+        sc_hum_max = function(v)
+            local n = math.clamp(tonumber(v) or CFG.scHumMax, 0, 500)
+            if n < CFG.scHumMin then n = CFG.scHumMin end
+            CFG.scHumMax = n
+            if type(M.SetValue) == "function" then pcall(M.SetValue, "sc_hum_max", n) end
+        end,
+        sc_react = function(v) CFG.scReact = math.clamp(tonumber(v) or 0, 0, 300) end,
+        sc_delay = function(v) CFG.scDelay = math.clamp(tonumber(v) or 0, 0, 300) end,
+        gen_range = function(v) API.gen.SetRange(v) end,
+        trap_range = function(v) API.trap.SetRange(v) end,
+        sc_lead = function(v) API.sc.SetLead(v) end,
+    }
+
+    local function addSection(tab, name, side)
+        if not tab or type(tab.Section) ~= "function" then return nil end
+        local ok, section = pcall(tab.Section, tab, name, side)
+        return ok and section or nil
+    end
+
+    local function addWidget(section, method, ...)
+        if not section or type(section[method]) ~= "function" then return nil end
+        local ok, result = pcall(section[method], section, ...)
+        return ok and result or nil
+    end
+
+    local function addToggle(section, id, label)
+        addWidget(section, "Toggle", id, label, values[id], function(value)
+            if type(value) ~= "boolean" then return end
+            values[id] = value
+            local apply = setters[id]
+            if apply then pcall(apply, value) end
+        end)
+    end
+
+    local function addSlider(section, id, label, minimum, maximum)
+        addWidget(section, "SliderInt", id, label, minimum, maximum, values[id], function(value)
+            if type(value) ~= "number" then return end
+            values[id] = value
+            local apply = setters[id]
+            if apply then pcall(apply, value) end
+        end)
+    end
+
+    local ok, err = pcall(M.AddTab, TAB_NAME, function(tab)
+        local esp = addSection(tab, "ESP", "Left")
+        addToggle(esp, "sw_gen", "Generator ESP")
+        addSlider(esp, "gen_range", "Generator range", 50, 10000)
+        addToggle(esp, "sw_trap", "Bear Trap ESP")
+        addSlider(esp, "trap_range", "Bear Trap range", 50, 10000)
+
+        local skill = addSection(tab, "Auto Skill Check", "Right")
+        addToggle(skill, "sc_on", "Auto Skill Check")
+        addToggle(skill, "sc_rescue", "Neutral rescue")
+        addSlider(skill, "sc_lead", "Early timing", 0, 12)
+        addToggle(skill, "sc_hum", "Humanized delay")
+        addSlider(skill, "sc_hum_min", "Humanize minimum ms", 0, 500)
+        addSlider(skill, "sc_hum_max", "Humanize maximum ms", 0, 500)
+        addSlider(skill, "sc_react", "Reaction delay ms", 0, 300)
+        addSlider(skill, "sc_delay", "Click delay ms", 0, 300)
+
+        local controls = addSection(tab, "Controls", "Left")
+        addWidget(controls, "Text", "No floating in-game HUD is created.")
+        addWidget(controls, "Button", "Unload Swangy", function()
+            pcall(API.unload)
+        end)
+    end)
+
+    if not ok then
+        if type(warn) == "function" then warn("[swangy] Matcha tab creation failed: " .. tostring(err)) end
+        return false
+    end
+
+    API.matchaCleanup = function()
+        if type(M.RemoveTab) == "function" then pcall(M.RemoveTab, TAB_NAME) end
+    end
+
+    -- Restore Matcha's saved widget values after the widgets have been registered.
+    -- This keeps the menu state and the running feature state synchronized.
+    if type(M.GetValue) == "function" then
+        task.spawn(function()
+            task.wait(0.25)
+            while running and _G.__SWANGY_LOAD == loadToken do
+                for id, apply in pairs(setters) do
+                    local okValue, value = pcall(M.GetValue, id)
+                    if okValue and value ~= nil and type(value) == type(values[id]) then
+                        if values[id] ~= value then
+                            values[id] = value
+                            pcall(apply, value)
+                        end
+                    end
+                end
+                task.wait(0.2)
+            end
+        end)
+    end
+
     return true
 end
 
-HUD.row = function(i)
-    local r = HUD.rows[i]
-    if r then return r end
-    local t = HUD.obj("Text", 48)
-    if not t then return nil end
-    t.Size, t.Font, t.Outline = 13, FONT, false
-    t.Transparency = 1
-    r = { t = t }
-    HUD.rows[i] = r
-    return r
-end
-
-HUD.setEnabled = function(on)
-    on = on and true or false
-    local el = HUD.toggleEl
-    if el then
-        if el.value ~= on then el:SetValue(on) end
-        for _, a in ipairs(el.addons or {}) do
-            if a.kind == "KeyPicker" then a.state = on end
-        end
-    end
-    CFG.hud = on
-    if not on then HUD.hide() end
-    return CFG.hud
-end
-
-HUD.render = function(now, moveOnly)
-    if not CFG.hud or not running then
-        if HUD.shown then HUD.hide() end
-        return
-    end
-    if not moveOnly then HUD.build(now) end
-    if not HUD.ensure() then return end
-
-    local lines = HUD.lines
-    local n = #lines
-    if n == 0 then if HUD.shown then HUD.hide() end return end
-
-    local w = HUD.w
-    local pitch = HUD.lineH or 16
-    local h = 26 + n * pitch + 6
-    local cam = Workspace.CurrentCamera
-    local vp = cam and cam.ViewportSize
-    local vw, vh = (vp and vp.X) or 1920, (vp and vp.Y) or 1080
-    if not HUD.x then
-        HUD.x, HUD.y = vw - w - 12, 44
-    end
-
-    local x, y = HUD.x, HUD.y
-    local mx, my, down, rdown
-    pcall(function() mx, my = mouse.X, mouse.Y end)
-    pcall(function() down = ismouse1pressed() == true end)
-    pcall(function() rdown = ismouse2pressed() == true end)
-
-    local closeX, closeY = x + w - 20, y + 5
-    local over = mx and mx >= x and mx <= x + w and my >= y and my <= y + h
-    local overClose = mx and mx >= closeX and mx <= closeX + 14 and my >= closeY and my <= closeY + 14
-
-    if mx and down and not HUD.wasDown then
-        if overClose then
-            HUD.wasDown = true
-            HUD.setEnabled(false)
-            return
-        elseif over then
-            HUD.drag = { mx - x, my - y }
-        end
-    end
-    if not down then HUD.drag = nil end
-    if HUD.drag and mx then
-        x = math.clamp(mx - HUD.drag[1], 0, vw - w)
-        y = math.clamp(my - HUD.drag[2], 0, vh - 40)
-        HUD.x, HUD.y = x, y
-    end
-    HUD.wasDown = down == true
-
-    if over and rdown and not HUD.wasRight then
-        HUD.wasRight = true
-        HUD.setEnabled(false)
-        return
-    end
-    HUD.wasRight = rdown == true
-
-    local bgAlpha = 1 - math.clamp(CFG.hudAlpha or 0, 0, 100) / 100
-
-    local L = UI
-    local theme = (L and L.Theme) or {}
-    local cBg = theme.bg or Color3.fromRGB(15, 15, 15)
-    local cLine = theme.outline or Color3.fromRGB(40, 40, 40)
-    local cAcc = theme.accent or Color3.fromRGB(124, 92, 255)
-    local cTxt = theme.text or Color3.fromRGB(255, 255, 255)
-
-    if HUD.gx ~= x or HUD.gy ~= y or HUD.gw ~= w or HUD.gh ~= h then
-        HUD.bg.Position = Vector2.new(x, y)
-        HUD.bg.Size = Vector2.new(w, h)
-        HUD.border.Position = Vector2.new(x, y)
-        HUD.border.Size = Vector2.new(w, h)
-        HUD.accent.Position = Vector2.new(x + 1, y + 24)
-        HUD.accent.Size = Vector2.new(w - 2, 1)
-        HUD.title.Position = Vector2.new(x + 10, y + 4)
-        HUD.close.Position = Vector2.new(x + w - 18, y + 3)
-        HUD.gx, HUD.gy, HUD.gw, HUD.gh = x, y, w, h
-    end
-
-    if HUD.cBg ~= cBg or HUD.aBg ~= bgAlpha then
-        HUD.bg.Color = cBg
-        HUD.bg.Transparency = bgAlpha * 0.96
-        HUD.cBg, HUD.aBg = cBg, bgAlpha
-    end
-    if HUD.cLine ~= cLine then HUD.border.Color = cLine HUD.cLine = cLine end
-    if HUD.cAcc ~= cAcc then HUD.accent.Color = cAcc HUD.cAcc = cAcc end
-    if HUD.cTxt ~= cTxt then HUD.title.Color = cTxt HUD.cTxt = cTxt end
-    if HUD.aChrome ~= bgAlpha then
-        HUD.border.Transparency = bgAlpha
-        HUD.accent.Transparency = bgAlpha
-        HUD.aChrome = bgAlpha
-    end
-
-    local cClose = overClose and cAcc or cLine
-    if HUD.cClose ~= cClose then HUD.close.Color = cClose HUD.cClose = cClose end
-
-    if not HUD.shown then
-        HUD.bg.Visible = true
-        HUD.border.Visible = true
-        HUD.accent.Visible = true
-        HUD.title.Visible = true
-        HUD.close.Visible = true
-        HUD.shown = true
-    end
-
-    for i = 1, n do
-        local r = HUD.row(i)
-        local d = lines[i]
-        if r and d then
-            if r.text ~= d.t then
-                r.t.Text = d.t
-                r.text = d.t
+local uiOK = buildMatchaUI()
+if not uiOK then
+    -- Matcha can finish exposing its UI library after the game services attach.
+    -- Retry without blocking the script or creating a second tab after success.
+    task.spawn(function()
+        while running and _G.__SWANGY_LOAD == loadToken do
+            task.wait(0.5)
+            if type(_G.UI) == "table" and type(_G.UI.AddTab) == "function" then
+                if buildMatchaUI() then return end
             end
-            if r.colour ~= d.c then
-                r.t.Color = d.c
-                r.colour = d.c
-            end
-            local rx, ry = x + 10, y + 28 + (i - 1) * pitch
-            if r.rx ~= rx or r.ry ~= ry then
-                r.t.Position = Vector2.new(rx, ry)
-                r.rx, r.ry = rx, ry
-            end
-            if not r.t.Visible then r.t.Visible = true end
         end
-    end
-    for i = n + 1, #HUD.rows do
-        local r = HUD.rows[i]
-        if r.t.Visible then r.t.Visible = false end
-    end
-    HUD.count = n
+    end)
 end
+API.ui = UI
 
-HUD.tick = function()
-    if not CFG.hud then
-        if HUD.shown then HUD.hide() end
-        return
-    end
-    local now = os.clock()
-    local every = (HUD.k.type and HUD.abilities[HUD.k.type]) and 0.2 or 0.1
-    if now - HUD.lastPoll >= every then
-        HUD.lastPoll = now
-        local t0 = os.clock()
-        pcall(HUD.pollKiller, now)
-        HUD.pollMs = HUD.pollMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
-    end
-    if CFG.hudSurvivors and HUD.localIsKiller() then
-        if now - HUD.scanAt >= 8 then
-            HUD.scanAt = now
-            local t0 = os.clock()
-            pcall(HUD.rescanSurvivors)
-            HUD.pollMs = HUD.pollMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
-        end
-        if now - HUD.survPollAt >= 2 then
-            HUD.survPollAt = now
-            local t0 = os.clock()
-            pcall(HUD.pollSurvivors, now)
-            HUD.pollMs = HUD.pollMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
-        end
-    end
-    local moving = HUD.drag ~= nil
-    if moving or now - HUD.lastDraw >= 1 / 8 then
-        HUD.lastDraw = now
-        local t0 = os.clock()
-        pcall(HUD.render, now, moving)
-        HUD.drawMs = HUD.drawMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
-    end
-end
-
-task.spawn(function()
-    -- a reload replaces __SWANGY_LOAD: a stale instance must stop drawing so
-    -- two panels can never stack their text on top of each other
-    while running and _G.__SWANGY_LOAD == loadToken do
-        local ok, err = pcall(HUD.tick)
-        if not ok then HUD.lastError = tostring(err) end
-        task.wait(ok and (HUD.drag and 1 / 60 or (CFG.hud and 0.08 or 0.25)) or 0.5)
-    end
-    pcall(HUD.destroy)
-end)
-
-API.hud = {}
-function API.hud.SetEnabled(on)
-    return HUD.setEnabled(on)
-end
-function API.hud.Toggle() return API.hud.SetEnabled(not CFG.hud) end
-function API.hud.SetTransparency(v)
-    CFG.hudAlpha = math.clamp(tonumber(v) or 0, 0, 100)
-    return CFG.hudAlpha
-end
-function API.hud.Lines()
-    local out = {}
-    for i = 1, #HUD.lines do out[i] = HUD.lines[i].t end
-    return out
-end
-function API.hud.Rows()
-    local out = {}
-    for i = 1, #HUD.rows do
-        local r = HUD.rows[i]
-        local t = r and r.t
-        local p = t and t.Position
-        out[i] = {
-            text = t and t.Text or nil,
-            x = p and math.floor(p.X + 0.5) or nil,
-            y = p and math.floor(p.Y + 0.5) or nil,
-            visible = t and t.Visible or false,
-            size = t and t.Size or nil,
-        }
-    end
-    return out, HUD.x, HUD.y, HUD.w
-end
-function API.hud.Panel()
-    return {
-        shown = HUD.shown, x = HUD.x, y = HUD.y, w = HUD.w,
-        visible = HUD.bg and HUD.bg.Visible or false,
-        rows = #HUD.rows,
-        bg = HUD.bg and HUD.bg.Transparency or nil,
-        title = HUD.title and HUD.title.Text or nil,
-        textAlpha = HUD.rows[1] and HUD.rows[1].t.Transparency or nil,
-    }
-end
-function API.hud.Stats()
-    return {
-        lines = HUD.count,
-        killer = HUD.k and HUD.k.type or nil,
-        gens = #genList,
-        traps = #trapList,
-        survivors = #HUD.surv,
-        perkSlots = HUD.perkSlots,
-        alpha = CFG.hudAlpha,
-        drawMs = HUD.drawMs,
-        pollMs = HUD.pollMs,
-        error = HUD.lastError,
-    }
-end
-
+_G.__SWANGY = API
 return API
