@@ -1698,10 +1698,196 @@ function API.sc.Stats()
     return scStats
 end
 
+-- Fast Vault: Matcha-controlled values, disabled by default.
+local VK_SHIFT = 0x10
+local VAULT_DEFAULTS = {
+    DISTANCE = 3.5,
+    REPEAT_DISTANCE = 4,
+    DOT = 0.7071067811865476,
+    MIN_SPEED = 12.5,
+    ARRIVE_GRACE = 0.12,
+    SIDESTEP_TIME = 0.25,
+}
+local VAULT_KEYS = { "DISTANCE", "REPEAT_DISTANCE", "DOT", "MIN_SPEED", "ARRIVE_GRACE", "SIDESTEP_TIME" }
+local VAULT = {
+    enabled = false, always = false, sprint = false, debug = false,
+    dist = 1.5, rdist = 1.5, dot = 0.2, speed = 6.0, side = 0.6, grace = 0.3,
+}
+local VAULT_UI_VALUES = {
+    vm_enabled = false, vm_always = false, vm_sprint = false,
+    vm_dist = 1.5, vm_rdist = 1.5, vm_dot = 0.2,
+    vm_speed = 6.0, vm_side = 0.6, vm_grace = 0.3, vm_debug = false,
+}
+
+local vaultStatus
+pcall(function()
+    vaultStatus = Drawing.new("Text")
+    vaultStatus.Outline = true
+    vaultStatus.Center = false
+    vaultStatus.Color = Color3.fromRGB(255, 255, 255)
+    vaultStatus.Position = Vector2.new(20, 300)
+    vaultStatus.Transparency = 1
+    vaultStatus.Visible = false
+end)
+
+local vaultCache, vaultCounts, vaultVals = nil, {}, {}
+local vaultScanErr, vaultApplyErr, vaultSkipped = "", "", ""
+local vaultLastSent, vaultLastScan, vaultNeedVerify = {}, 0, false
+local vaultWasEnabled, vaultSprintHeld = false, false
+
+local function vaultGetDesired()
+    if VAULT.always then
+        return { DISTANCE = 0.1, REPEAT_DISTANCE = 0.1, DOT = -1,
+            MIN_SPEED = 0, ARRIVE_GRACE = 1, SIDESTEP_TIME = 5 }
+    end
+    return {
+        DISTANCE = VAULT.dist, REPEAT_DISTANCE = VAULT.rdist, DOT = VAULT.dot,
+        MIN_SPEED = VAULT.speed, ARRIVE_GRACE = VAULT.grace, SIDESTEP_TIME = VAULT.side,
+    }
+end
+
+local function vaultScan()
+    vaultLastScan = tick()
+    local ok, result = pcall(getgc, VAULT_KEYS)
+    vaultCounts, vaultVals = {}, {}
+    if ok and type(result) == "table" then
+        vaultCache, vaultScanErr = result, ""
+        for _, entry in ipairs(result) do
+            local okKey, key = pcall(function() return entry.key end)
+            local okValue, value = pcall(function() return entry.value end)
+            if okKey and key then
+                vaultCounts[key] = (vaultCounts[key] or 0) + 1
+                if vaultVals[key] == nil and okValue then vaultVals[key] = value end
+            end
+        end
+    else
+        vaultCache, vaultScanErr = nil, tostring(result)
+    end
+end
+
+local function vaultSend(values, force)
+    if not vaultCache then return end
+    local send, skipped, count = {}, {}, 0
+    for key, value in pairs(values) do
+        local found = vaultCounts[key] or 0
+        if found == 0 then
+            skipped[#skipped + 1] = key .. "(none)"
+        elseif force or vaultLastSent[key] ~= value then
+            send[key] = value
+            count = count + 1
+        end
+    end
+    vaultSkipped = table.concat(skipped, " ")
+    if count > 0 then
+        local ok, err = pcall(applygc, vaultCache, send)
+        if ok then
+            vaultApplyErr = ""
+            for key, value in pairs(send) do vaultLastSent[key] = value end
+            if not force then vaultNeedVerify = true end
+        else
+            vaultApplyErr = tostring(err)
+        end
+    end
+end
+
+local function vaultFmt(value)
+    if type(value) == "number" then return string.format("%.2f", value) end
+    if value == nil then return "?" end
+    return tostring(value)
+end
+
+local function vaultUpdateStatus()
+    if not vaultStatus then return end
+    if VAULT.debug and VAULT.enabled then
+        local parts = {}
+        for _, key in ipairs(VAULT_KEYS) do
+            parts[#parts + 1] = key .. " x" .. (vaultCounts[key] or 0) .. "=" .. vaultFmt(vaultVals[key])
+        end
+        local line = table.concat(parts, "\n")
+        if not vaultCache then line = "getgc FAILED: " .. vaultScanErr end
+        if vaultSkipped ~= "" then line = line .. "\nskipped: " .. vaultSkipped end
+        if vaultApplyErr ~= "" then line = line .. "\napplygc ERROR: " .. vaultApplyErr end
+        vaultStatus.Text = line
+        vaultStatus.Visible = true
+    else
+        vaultStatus.Visible = false
+    end
+end
+
+local function vaultReleaseSprint()
+    if vaultSprintHeld then
+        pcall(keyrelease, VK_SHIFT)
+        vaultSprintHeld = false
+    end
+end
+
+local function vaultShutdown()
+    if vaultWasEnabled and vaultCache then
+        pcall(vaultSend, VAULT_DEFAULTS, true)
+    end
+    vaultReleaseSprint()
+    if vaultStatus then
+        pcall(function() vaultStatus.Visible = false end)
+        pcall(function() vaultStatus:Remove() end)
+        vaultStatus = nil
+    end
+end
+
+-- The Matcha widget values are restored on reinjection; this loop only runs
+-- the vault logic while its dedicated toggle is enabled.
+task.spawn(function()
+    local lastForce = 0
+    while running do
+        task.wait(0.2)
+        local ok, err = pcall(function()
+            local enabled = VAULT.enabled
+            if enabled and (not vaultWasEnabled or not vaultCache or tick() - vaultLastScan > 60) then
+                vaultScan()
+                lastForce = 0
+                vaultNeedVerify = true
+            end
+            if enabled then
+                local force = tick() - lastForce > 5
+                vaultSend(vaultGetDesired(), force)
+                if force then lastForce = tick() end
+            elseif vaultWasEnabled and vaultCache then
+                vaultSend(VAULT_DEFAULTS, true)
+                vaultLastSent = {}
+            end
+            vaultWasEnabled = enabled
+
+            if vaultNeedVerify and enabled and tick() - vaultLastScan > 2 then
+                vaultNeedVerify = false
+                vaultScan()
+            end
+
+            local active = false
+            if type(isrbxactive) == "function" then
+                local activeOk, activeValue = pcall(isrbxactive)
+                active = activeOk and activeValue == true
+            end
+            local wantSprint = enabled and VAULT.sprint and active
+            if wantSprint and not vaultSprintHeld then
+                pcall(keypress, VK_SHIFT)
+                vaultSprintHeld = true
+            elseif not wantSprint then
+                vaultReleaseSprint()
+            end
+            vaultUpdateStatus()
+        end)
+        if not ok then
+            if type(warn) == "function" then warn("[VaultMod] " .. tostring(err)) end
+            task.wait(1)
+        end
+    end
+    vaultShutdown()
+end)
+
 function API.unload()
     if not running then return end
     running = false
     scReleaseInput()
+    pcall(vaultShutdown)
     if API.matchaCleanup then pcall(API.matchaCleanup) end
     if connection then pcall(function() connection:Disconnect() end); connection = nil end
     for i = 1, #genPool do removeSlot(genPool[i]) end
@@ -2212,6 +2398,16 @@ local function buildMatchaUI()
         pp_health = CFG.ppHealth,
         pp_windup = CFG.ppWindup,
         pp_equip = CFG.ppEquip,
+        vm_enabled = VAULT_UI_VALUES.vm_enabled,
+        vm_always = VAULT_UI_VALUES.vm_always,
+        vm_sprint = VAULT_UI_VALUES.vm_sprint,
+        vm_dist = VAULT_UI_VALUES.vm_dist,
+        vm_rdist = VAULT_UI_VALUES.vm_rdist,
+        vm_dot = VAULT_UI_VALUES.vm_dot,
+        vm_speed = VAULT_UI_VALUES.vm_speed,
+        vm_side = VAULT_UI_VALUES.vm_side,
+        vm_grace = VAULT_UI_VALUES.vm_grace,
+        vm_debug = VAULT_UI_VALUES.vm_debug,
     }
 
     local setters = {
@@ -2242,6 +2438,16 @@ local function buildMatchaUI()
         pp_health = function(v) CFG.ppHealth = math.clamp(tonumber(v) or CFG.ppHealth, 10, 100) end,
         pp_windup = function(v) CFG.ppWindup = v == true end,
         pp_equip = function(v) CFG.ppEquip = v == true end,
+        vm_enabled = function(v) VAULT.enabled = v == true end,
+        vm_always = function(v) VAULT.always = v == true end,
+        vm_sprint = function(v) VAULT.sprint = v == true end,
+        vm_dist = function(v) VAULT.dist = math.clamp(tonumber(v) or VAULT.dist, 0.1, 3.5) end,
+        vm_rdist = function(v) VAULT.rdist = math.clamp(tonumber(v) or VAULT.rdist, 0.1, 4.0) end,
+        vm_dot = function(v) VAULT.dot = math.clamp(tonumber(v) or VAULT.dot, -1.0, 0.71) end,
+        vm_speed = function(v) VAULT.speed = math.clamp(tonumber(v) or VAULT.speed, 0.0, 12.5) end,
+        vm_side = function(v) VAULT.side = math.clamp(tonumber(v) or VAULT.side, 0.25, 5.0) end,
+        vm_grace = function(v) VAULT.grace = math.clamp(tonumber(v) or VAULT.grace, 0.12, 1.0) end,
+        vm_debug = function(v) VAULT.debug = v == true end,
     }
 
     local function addSection(tab, name, side)
@@ -2260,6 +2466,7 @@ local function buildMatchaUI()
         addWidget(section, "Toggle", id, label, values[id], function(value)
             if type(value) ~= "boolean" then return end
             values[id] = value
+            if string.sub(id, 1, 3) == "vm_" then VAULT_UI_VALUES[id] = value end
             local apply = setters[id]
             if apply then pcall(apply, value) end
         end)
@@ -2272,6 +2479,13 @@ local function buildMatchaUI()
             local apply = setters[id]
             if apply then pcall(apply, value) end
         end)
+    end
+
+    local function addFloatSlider(section, id, label, minimum, maximum, format)
+        -- Matcha's SliderFloat signature follows the supplied Vault snippet:
+        -- id, label, min, max, initial value, format. The GetValue restore
+        -- loop below reads and applies the current value after widget creation.
+        addWidget(section, "SliderFloat", id, label, minimum, maximum, values[id], format or "%.2f")
     end
 
     local ok, err = pcall(M.AddTab, TAB_NAME, function(tab)
@@ -2299,6 +2513,20 @@ local function buildMatchaUI()
         addToggle(parry, "pp_windup", "Windup detection")
         addToggle(parry, "pp_equip", "Auto-equip parrying dagger")
         addWidget(parry, "Text", "Uses the original killer windup detection and simulated right-click parry.")
+
+        local vault = addSection(tab, "Fast Vault", "Right")
+        addToggle(vault, "vm_enabled", "Enable Fast Vault")
+        addToggle(vault, "vm_always", "Always Fast Vault (max preset)")
+        addToggle(vault, "vm_sprint", "Hold Shift (sprint required)")
+        addWidget(vault, "Text", "Manual values are used when the max preset is off.")
+        addFloatSlider(vault, "vm_dist", "Run-up Distance", 0.1, 3.5, "%.2f")
+        addFloatSlider(vault, "vm_rdist", "Repeat Run-up", 0.1, 4.0, "%.2f")
+        addFloatSlider(vault, "vm_dot", "Angle Strictness", -1.0, 0.71, "%.2f")
+        addFloatSlider(vault, "vm_speed", "Min Pace", 0.0, 12.5, "%.1f")
+        addFloatSlider(vault, "vm_side", "Sidestep Time", 0.25, 5.0, "%.2f")
+        addFloatSlider(vault, "vm_grace", "Arrive Grace", 0.12, 1.0, "%.2f")
+        addToggle(vault, "vm_debug", "Show Debug Line")
+        addWidget(vault, "Text", "Turning Fast Vault off restores the original default values.")
 
         local scope = addSection(tab, "Original feature scope", "Left")
         addWidget(scope, "Text", "Auto Skill Check covers generator checks and butcher-trap checks. Neutral rescue is a timing fallback, not a separate player-rescue action.")
@@ -2329,6 +2557,7 @@ local function buildMatchaUI()
                     if okValue and value ~= nil and type(value) == type(values[id]) then
                         if values[id] ~= value then
                             values[id] = value
+                            if string.sub(id, 1, 3) == "vm_" then VAULT_UI_VALUES[id] = value end
                             pcall(apply, value)
                         end
                     end
