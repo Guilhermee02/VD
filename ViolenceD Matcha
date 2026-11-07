@@ -1,4 +1,5 @@
--- GUILHERME ZICA: generator ESP, bear-trap ESP, auto skill checks, and Fast Vault.
+-- GUILHERME ZICA: stabilized generator ESP, bear-trap ESP, auto skill checks, and Fast Vault.
+-- Auto Parry removed. Render, trap-root lookup, and skill-check offset probing are guarded.
 -- Matcha is the only control panel; no separate in-game HUD is created.
 
 local previous = _G.__GUILHERME_ZICA or _G.__SWANGY
@@ -102,8 +103,8 @@ pcall(function() mouse = lp:GetMouse() end)
 local CFG = {
     -- Drawing is capped at 30 Hz instead of running expensive projections
     -- on every render frame. Filled polygons are opt-in to reduce CPU spikes.
-    drawHz = 30,
-    pollHz = 1.5,
+    drawHz = 24,
+    pollHz = 1.0,
 
     gen = true,
     genRange = 1000,
@@ -825,24 +826,37 @@ local function trapMeasure(inst)
     return center, hx, hy, hz, right, up, back
 end
 
+local trapRootMap, trapRootCache, trapRootRefreshAt = nil, {}, 0
 local function trapRoots(map)
-    local out = {}
-    local okKids, kids = pcall(function() return map:GetChildren() end)
-    if not okKids or type(kids) ~= "table" then kids = {} end
-    for _, ch in ipairs(kids) do
-        local n = lower(ch.Name)
-        if n == "beartrap" or n == "beartraps" then out[#out + 1] = ch end
+    local now = os.clock()
+    if map ~= trapRootMap or now >= trapRootRefreshAt then
+        trapRootMap = map
+        trapRootRefreshAt = now + 10
+        local out = {}
+        local okKids, kids = pcall(function() return map:GetChildren() end)
+        if not okKids or type(kids) ~= "table" then kids = {} end
+        for _, ch in ipairs(kids) do
+            local n = lower(ch.Name)
+            if n == "beartrap" or n == "beartraps" then out[#out + 1] = ch end
+        end
+        -- Recursive discovery is expensive on large maps; do it only when
+        -- the direct-child lookup finds nothing, and cache the result for 10s.
+        if #out == 0 then
+            local ok, found = pcall(function() return map:FindFirstChild("BearTrap", true) end)
+            if ok and found then out[1] = found end
+        end
+        trapRootCache = out
     end
-    if #out == 0 then
-        local ok, found = pcall(function() return map:FindFirstChild("BearTrap", true) end)
-        if ok and found then out[1] = found end
-    end
-    return out
+    return trapRootCache
 end
 
 local function collectTraps()
     local map = Workspace:FindFirstChild("Map")
-    if not map then trapIndex = {} return {} end
+    if not map then
+        trapIndex = {}
+        trapRootMap, trapRootCache, trapRootRefreshAt = nil, {}, 0
+        return {}
+    end
 
     local out, nextIndex, now = {}, {}, os.clock()
 
@@ -1063,7 +1077,8 @@ local SC_OFF = 0xD0
 
 local scTrack = { trace = {} }
 local scGui = {
-    refreshAt = 0, off = SC_OFF, verified = false, scanAt = 0, ids = "",
+    refreshAt = 0, off = SC_OFF, verified = false, scanAt = 0, scanOff = 0x40,
+    knownCheckAt = 0, ids = "",
     line = nil, goal = nil, trapGoal = nil, trapPerfect = nil,
 }
 local scInput, scInputAt = nil, 0
@@ -1148,26 +1163,59 @@ local function scBind(now)
     if ids ~= scGui.ids then
         scGui.ids = ids
         scTrack = { trace = {} }
+        scGui.verified = false
+        scGui.off = SC_OFF
+        scGui.scanOff = 0x40
+        scGui.scanAt = 0
+        scGui.knownCheckAt = 0
     end
     scGui.line, scGui.goal, scGui.trapGoal, scGui.trapPerfect = line, goal, tg, tp
 end
 
 local function scEnsureOff(now)
     if scGui.verified then return scGui.off end
-    if scGui.line and scGui.goal
-        and scAngleAt(scGui.line, SC_OFF) and scAngleAt(scGui.goal, SC_OFF) then
-        scGui.off, scGui.verified = SC_OFF, true
-        scStats.offset = string.format("0x%X", SC_OFF)
-        return SC_OFF
+    if not scGui.line or not scGui.goal then return nil end
+
+    -- Check the known offset first. If it is not valid, probe only a few
+    -- candidates per pass; the previous full scan could issue >1,400 memory
+    -- reads in a single tick and freeze the executor during a skill check.
+    if now >= (scGui.knownCheckAt or 0) then
+        scGui.knownCheckAt = now + 0.25
+        local knownOk = false
+        local okKnown = pcall(function()
+            knownOk = scAngleAt(scGui.line, SC_OFF) ~= nil
+                and scAngleAt(scGui.goal, SC_OFF) ~= nil
+        end)
+        if okKnown and knownOk then
+            scGui.off, scGui.verified = SC_OFF, true
+            scStats.offset = string.format("0x%X", SC_OFF)
+            return SC_OFF
+        end
     end
+
     if now < scGui.scanAt then return nil end
-    scGui.scanAt = now + 2
-    for off = 0x40, 0x400, 4 do
-        if off ~= SC_OFF and scGui.line and scGui.goal
-            and scAngleAt(scGui.line, off) and scAngleAt(scGui.goal, off) then
-            scGui.off, scGui.verified = off, true
-            scStats.offset = string.format("0x%X", off)
-            return off
+    scGui.scanAt = now + 0.05
+    local checked = 0
+    while checked < 4 do
+        local off = scGui.scanOff or 0x40
+        if off > 0x400 then
+            scGui.scanOff = 0x40
+            scGui.scanAt = now + 1.0
+            break
+        end
+        scGui.scanOff = off + 4
+        checked = checked + 1
+        if off ~= SC_OFF then
+            local found = false
+            local okCandidate = pcall(function()
+                found = scAngleAt(scGui.line, off) ~= nil
+                    and scAngleAt(scGui.goal, off) ~= nil
+            end)
+            if okCandidate and found then
+                scGui.off, scGui.verified = off, true
+                scStats.offset = string.format("0x%X", off)
+                return off
+            end
         end
     end
     return nil
@@ -1207,6 +1255,7 @@ local scHeld = nil
 -- This lock prevents Sprint from being re-pressed during a skill-check tap.
 local vaultReleaseSprint
 local vaultInputBusy = false
+local vaultBlockSprintUntil = 0
 
 local function scReleaseInput()
     local held = scHeld
@@ -1220,6 +1269,7 @@ end
 local function scPress(input)
     -- Avoid a held Sprint key interfering with a skill-check key press.
     vaultInputBusy = true
+    vaultBlockSprintUntil = os.clock() + 0.75
     if vaultReleaseSprint then pcall(vaultReleaseSprint) end
     scHeld = input
     local ok, err
@@ -1235,7 +1285,6 @@ end
 local scTick = { n = 0, t = os.clock() }
 local scWasEnabled = false
 
-local scBusyUntil = 0
 
 local function scTrackSample(lr, d)
     scStats.line = lr
@@ -1437,7 +1486,6 @@ local function scStep()
         if started then
             scStats.checks = scStats.checks + 1
             scResetCheck()
-            scBusyUntil = math.max(scBusyUntil, now + 2.5)
             scTrack.speed, scTrack.sampleAt, scTrack.scheduled = nil, nil, false
             scEvent(string.format("start base=%.1f lr=%.1f prev=%s tg=%s tp=%s",
                 scTrack.base, lr, tostring(prev), tostring(tg), tostring(tp)))
@@ -1472,7 +1520,6 @@ local function scStep()
             local early = (speed > 20) and (want * speed) or 0
             scStats.phase = phase
             scStats.window = string.format("%.0f..%.0f", lo, hi)
-            if phase < 345 then scBusyUntil = now + 0.4 end
             if not scTrack.fired and not scTrack.missed then
                 if phase >= lo + leadAdj - early and phase <= hi then
                     fired, why = true, "trap perfect"
@@ -1529,7 +1576,6 @@ local function scStep()
 
             if gr ~= 0 then scStats.checks = scStats.checks + 1 end
             scResetCheck()
-            scBusyUntil = math.max(scBusyUntil, now + 2.5)
             scTrack.speed, scTrack.sampleAt = nil, nil
         end
         scTrack.lr, scTrack.goal = lr, gr
@@ -1658,7 +1704,7 @@ local function refreshWorld()
     worldMs = worldMs * 0.8 + (os.clock() - started) * 1000 * 0.2
 end
 
-connection = RunService.RenderStepped:Connect(function()
+local function renderFrame()
     if not running or _G.__GUILHERME_ZICA_LOAD ~= loadToken then return end
 
     local now = os.clock()
@@ -1697,11 +1743,27 @@ connection = RunService.RenderStepped:Connect(function()
     end
 
     renderMs = renderMs * 0.9 + (os.clock() - now) * 1000 * 0.1
+end
+
+connection = RunService.RenderStepped:Connect(function()
+    local ok, err = pcall(renderFrame)
+    if not ok then
+        CFG.renderErrors = (CFG.renderErrors or 0) + 1
+        CFG.lastRenderError = tostring(err)
+        -- Fail closed for this frame: hide active boxes instead of leaving
+        -- frozen drawings on screen. The next frame gets a clean retry.
+        for i = 1, genShown do pcall(hideSlot, genPool[i]) end
+        for i = 1, trapShown do pcall(hideSlot, trapPool[i]) end
+        genShown, trapShown = 0, 0
+    else
+        CFG.renderErrors = 0
+        CFG.lastRenderError = nil
+    end
 end)
 
 task.spawn(function()
     while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
-        if os.clock() >= scBusyUntil then pcall(refreshWorld) end
+        pcall(refreshWorld)
         task.wait(1 / math.max(CFG.pollHz, 0.1))
     end
 end)
@@ -1740,7 +1802,10 @@ task.spawn(function()
         local ok, err = pcall(scStep)
         if not ok then
             scReleaseInput()
-            scTrack = {}
+            vaultInputBusy = false
+            scTrack = { trace = {} }
+            scPressToken = scPressToken + 1
+            scGui.refreshAt = 0
             scStats.errors = scStats.errors + 1
             scStats.error, scStats.status = tostring(err), "read error, retrying"
         end
@@ -1879,6 +1944,18 @@ local function vaultScan(isRefresh)
         return false, false
     end
 
+    local complete = true
+    for i = 1, #VAULT_KEYS do
+        if (counts[VAULT_KEYS[i]] or 0) == 0 then complete = false break end
+    end
+
+    if not complete then
+        vaultScanErr = "partial Fast Vault values; waiting for all six keys"
+        vaultPartialScans = vaultPartialScans + 1
+        vaultNextScanAt = now + (vaultPartialScans <= 4 and 3 or 20)
+        return false, false
+    end
+
     local hadCache = vaultCache ~= nil
     vaultCache = result
     vaultCounts, vaultVals = counts, values
@@ -1896,27 +1973,17 @@ local function vaultScan(isRefresh)
         end
     end
 
-    local complete = true
-    for i = 1, #VAULT_KEYS do
-        if (counts[VAULT_KEYS[i]] or 0) == 0 then complete = false break end
-    end
-
     if not hadCache or isRefresh then
         vaultLastSent = {}
         vaultNextApplyAt = 0
     end
 
-    if complete then
-        vaultPartialScans = 0
-        vaultLastFullScan = now
-        vaultNextScanAt = now + 60
-    else
-        vaultPartialScans = vaultPartialScans + 1
-        -- Retry missing entries a few times while the game initializes, then
-        -- back off to avoid repeatedly walking the GC during a match.
-        vaultNextScanAt = now + (vaultPartialScans <= 4 and 3 or 20)
-    end
-    return true, complete
+    vaultPartialScans = 0
+    vaultLastFullScan = now
+    -- Do not run another full GC scan every minute during gameplay. The
+    -- successful cache remains in use until the script is reloaded.
+    vaultNextScanAt = math.huge
+    return true, true
 end
 
 local function vaultSend(values, force)
@@ -1951,7 +2018,7 @@ local function vaultSend(values, force)
     end
 
     vaultApplyErr = ok and "applygc returned false" or tostring(result)
-    vaultNextApplyAt = os.clock() + 1
+    vaultNextApplyAt = os.clock() + 3
     return false
 end
 
@@ -2083,7 +2150,8 @@ task.spawn(function()
                 local activeOk, activeValue = pcall(isrbxactive)
                 active = activeOk and activeValue == true
             end
-            local wantSprint = enabled and VAULT.sprint and active and not vaultInputBusy
+            local wantSprint = enabled and VAULT.sprint and active
+                and not vaultInputBusy and now >= vaultBlockSprintUntil
             if wantSprint and not vaultSprintHeld then
                 local pressOk, pressResult = pcall(keypress, VK_SHIFT)
                 if pressOk and pressResult ~= false then
