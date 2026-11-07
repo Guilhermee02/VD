@@ -1,4 +1,4 @@
--- GUILHERME ZICA: generator ESP, bear-trap ESP, auto skill checks, and Auto Parry.
+-- GUILHERME ZICA: generator ESP, bear-trap ESP, auto skill checks, and Fast Vault.
 -- Matcha is the only control panel; no separate in-game HUD is created.
 
 local previous = _G.__GUILHERME_ZICA or _G.__SWANGY
@@ -100,15 +100,17 @@ pcall(function() mouse = lp:GetMouse() end)
 
 -- Kept features: Generator ESP, Bear Trap ESP, and automatic skill checks.
 local CFG = {
-    drawHz = 0,
-    pollHz = 2,
+    -- Drawing is capped at 30 Hz instead of running expensive projections
+    -- on every render frame. Filled polygons are opt-in to reduce CPU spikes.
+    drawHz = 30,
+    pollHz = 1.5,
 
     gen = true,
     genRange = 1000,
-    genPool = 16,
+    genPool = 12,
     genText = 13,
     genState = true,
-    genFill = true,
+    genFill = false,
     genFillA = 0.25,
     genThick = 1.6,
     genIdleColour = Color3.fromRGB(255, 150, 40),
@@ -117,9 +119,9 @@ local CFG = {
 
     trap = true,
     trapRange = 1000,
-    trapPool = 12,
+    trapPool = 8,
     trapText = 12,
-    trapFill = true,
+    trapFill = false,
     trapFillA = 0.20,
     trapThick = 1.6,
     trapArmedColour = Color3.fromRGB(80, 255, 120),
@@ -140,22 +142,6 @@ local CFG = {
     scRescue = true,
     scDry = false,
     scMode = nil,
-
-    -- Original Auto Parry settings
-    pp = true,
-    ppRange = 14,
-    ppMinRange = 13,
-    ppPing = true,
-    ppFacing = true,
-    ppAim = true,
-    ppHealth = 50,
-    ppInterval = 0.45,
-    ppEquip = true,
-    ppEquipRange = 45,
-    ppWindup = true,
-    ppWindupHz = 120,
-    ppScanRange = 70,
-    ppHz = 120,
 
 }
 
@@ -183,38 +169,46 @@ local CORNER = {
 -- esp
 local function newSlot(thick, textSize)
     local lines = {}
-    for i = 1, 12 do
-        local ln = Drawing.new("Line")
-        ln.Thickness = thick
-        ln.Visible = false
-        lines[i] = ln
-    end
-    local tris = {}
-    for i = 1, 6 do
-        local tr = Drawing.new("Triangle")
-        tr.Thickness = 0
-        pcall(function() tr.Filled = true end)
-        tr.Visible = false
-        tris[i] = tr
-    end
-    local top = Drawing.new("Text")
-    top.Size, top.Outline, top.Center, top.Visible = textSize, true, true, false
-    pcall(function() top.Font = FONT end)
-    local sub = Drawing.new("Text")
-    sub.Size, sub.Outline, sub.Center, sub.Visible = textSize - 2, true, true, false
-    pcall(function() sub.Font = FONT end)
-    return {
-        lines = lines, tris = tris, top = top, sub = sub,
+    local top, sub
 
-        px = {}, py = {},
-        lf = {}, lt = {}, lth = {}, lcol = {}, lvis = {},
-    }
+    local ok, slot = pcall(function()
+        for i = 1, 12 do
+            local ln = Drawing.new("Line")
+            ln.Thickness = thick
+            ln.Visible = false
+            lines[i] = ln
+        end
+
+        top = Drawing.new("Text")
+        top.Size, top.Outline, top.Center, top.Visible = textSize, true, true, false
+        pcall(function() top.Font = FONT end)
+
+        sub = Drawing.new("Text")
+        sub.Size, sub.Outline, sub.Center, sub.Visible = textSize - 2, true, true, false
+        pcall(function() sub.Font = FONT end)
+
+        return {
+            lines = lines, tris = nil, top = top, sub = sub,
+            px = {}, py = {}, lf = {}, lt = {}, lth = {}, lcol = {}, lvis = {},
+        }
+    end)
+
+    if ok and slot then return slot end
+
+    -- If the executor refuses a Drawing allocation, clean up the partial slot
+    -- instead of leaking half-created objects on every retry.
+    for i = 1, #lines do pcall(function() lines[i]:Remove() end) end
+    if top then pcall(function() top:Remove() end) end
+    if sub then pcall(function() sub:Remove() end) end
+    return nil
 end
 
 local function removeSlot(e)
     if not e then return end
     for _, ln in ipairs(e.lines) do pcall(function() ln:Remove() end) end
-    for _, tr in ipairs(e.tris) do pcall(function() tr:Remove() end) end
+    if e.tris then
+        for _, tr in ipairs(e.tris) do pcall(function() tr:Remove() end) end
+    end
     pcall(function() e.top:Remove() end)
     pcall(function() e.sub:Remove() end)
 end
@@ -225,21 +219,63 @@ local function hideSlot(e)
         e.lvis[i] = false
         if e.lines[i].Visible then e.lines[i].Visible = false end
     end
-    for i = 1, 6 do
-        if e.tris[i].Visible then e.tris[i].Visible = false end
+    if e.tris then
+        for i = 1, 6 do
+            if e.tris[i].Visible then e.tris[i].Visible = false end
+        end
     end
     if e.top.Visible then e.top.Visible = false end
     if e.sub.Visible then e.sub.Visible = false end
 end
 
--- slots are built on first use: the old load created every pool up front
--- (104 slots = 2,080 Drawing objects) before a single target existed, which
--- is what made loading and reloading the executor heavy
-local function ensureSlots(pool, count, thick, text)
-    -- called from the collectors, never from the render callback: creating a
-    -- Drawing while the renderer is running is what the executor docs warn about
+local function ensureTriangles(e)
+    if not e or e.tris then return true end
+
+    local tris = {}
+    for i = 1, 6 do
+        local ok, tr = pcall(Drawing.new, "Triangle")
+        if not ok or not tr then
+            for j = 1, #tris do pcall(function() tris[j]:Remove() end) end
+            return false
+        end
+
+        local propOk = pcall(function()
+            tr.Thickness = 0
+            tr.Filled = true
+            tr.Visible = false
+        end)
+        if not propOk then
+            pcall(function() tr:Remove() end)
+            for j = 1, #tris do pcall(function() tris[j]:Remove() end) end
+            return false
+        end
+        tris[i] = tr
+    end
+
+    e.tris = tris
+    return true
+end
+
+local function ensureSlots(pool, count, thick, text, needFill)
+    -- Called by background collectors, never by the render callback.
+    -- Create a maximum of four new slots/fill sets per pass to avoid spikes.
+    local work = 0
     for i = 1, count do
-        if not pool[i] then pool[i] = newSlot(thick, text) end
+        local created = false
+        if not pool[i] then
+            local slot = newSlot(thick, text)
+            if not slot then break end
+            pool[i] = slot
+            created = true
+        end
+
+        local fillCreated = false
+        if needFill and not pool[i].tris then
+            fillCreated = ensureTriangles(pool[i])
+        end
+
+        if created or fillCreated then work = work + 1 end
+        if work >= 4 then break end
     end
 end
 
@@ -252,8 +288,10 @@ local function hideBox(e)
             e.lines[i].Visible = false
         end
     end
-    for i = 1, 6 do
-        if e.tris[i].Visible then e.tris[i].Visible = false end
+    if e.tris then
+        for i = 1, 6 do
+            if e.tris[i].Visible then e.tris[i].Visible = false end
+        end
     end
 end
 
@@ -386,7 +424,7 @@ local function drawBox(e, center, hx, hy, hz, right, up, back, colour, fillAlpha
         end
     end
 
-    if fillAlpha and frontN == 8 and (botY - topY) >= 26 then
+    if fillAlpha and e.tris and frontN == 8 and (botY - topY) >= 26 then
         local hullPts = {}
         for i = 1, 8 do
             local x, y = px[i], py[i]
@@ -410,7 +448,7 @@ local function drawBox(e, center, hx, hy, hz, right, up, back, colour, fillAlpha
         for i = tri + 1, 6 do
             if e.tris[i].Visible then e.tris[i].Visible = false end
         end
-    elseif e.tris[1].Visible then
+    elseif e.tris and e.tris[1].Visible then
         for i = 1, 6 do e.tris[i].Visible = false end
     end
 
@@ -638,74 +676,91 @@ end
 
 local function drawGens(camPos, now)
     local n = 0
+    local range = CFG.genRange
+    local rangeSq = range * range
+
     for i = 1, #genList do
         if n >= CFG.genPool then break end
         local t = genList[i]
-        local d = (t.center - camPos).Magnitude
-        if d <= CFG.genRange then
-            n = n + 1
-            local e = genPool[n]
-            if not e then n = n - 1 break end
-            local colour = genColour(t.prog, t.state)
 
-            local topY
-            if CFG.namesOnly then
-                hideBox(e)
-            else
-                local okBox
-                okBox, topY = pcall(drawBox, e, t.center, t.hx, t.hy, t.hz,
-                    t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
-                    colour, CFG.genFill and CFG.genFillA or nil, CFG.genThick)
-                if not okBox then topY = nil end
-            end
+        local dx, dy, dz = t.center.X - camPos.X, t.center.Y - camPos.Y, t.center.Z - camPos.Z
+        local d2 = dx * dx + dy * dy + dz * dz
+        if d2 <= rangeSq then
+            local nextSlot = n + 1
+            local e = genPool[nextSlot]
+            if not e then break end
 
-            local top, okT = WorldToScreen(t.center + Vector3.new(0, t.hy, 0))
-            local bot, okB = WorldToScreen(t.center - Vector3.new(0, t.hy, 0))
-            if okT and okB and top and bot then
+            local okEntry = pcall(function()
+                local d = math.sqrt(d2)
+                local colour = genColour(t.prog, t.state)
+                local topY
 
-                local pct, dm = math.floor(t.prog + 0.5), math.floor(d + 0.5)
-                if e.lpct ~= pct or e.ldm ~= dm or e.lstate ~= t.state or e.lcrew ~= t.crew
-                    or e.lnames ~= CFG.names then
-                    e.lpct, e.ldm, e.lstate, e.lcrew, e.lnames = pct, dm, t.state, t.crew, CFG.names
+                if CFG.namesOnly then
+                    hideBox(e)
+                else
+                    local okBox
+                    okBox, topY = pcall(drawBox, e, t.center, t.hx, t.hy, t.hz,
+                        t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
+                        colour, CFG.genFill and CFG.genFillA or nil, CFG.genThick)
+                    if not okBox then topY = nil end
+                end
 
-                    local line1 = CFG.names and string.format("GEN %d%%   %dm", pct, dm)
-                        or string.format("%d%%", pct)
-                    local line2 = ""
-                    if CFG.genState and CFG.names then
-                        line2 = t.state
-                        if t.crew > 0 then line2 = line2 .. "  x" .. t.crew end
+                local top, okT = WorldToScreen(t.center + Vector3.new(0, t.hy, 0))
+                local bot, okB = WorldToScreen(t.center - Vector3.new(0, t.hy, 0))
+                if okT and okB and top and bot then
+                    local pct, dm = math.floor(t.prog + 0.5), math.floor(d + 0.5)
+                    if e.lpct ~= pct or e.ldm ~= dm or e.lstate ~= t.state or e.lcrew ~= t.crew
+                        or e.lnames ~= CFG.names then
+                        e.lpct, e.ldm, e.lstate, e.lcrew, e.lnames = pct, dm, t.state, t.crew, CFG.names
+
+                        local line1 = CFG.names and string.format("GEN %d%%   %dm", pct, dm)
+                            or string.format("%d%%", pct)
+                        local line2 = ""
+                        if CFG.genState and CFG.names then
+                            line2 = t.state
+                            if t.crew > 0 then line2 = line2 .. "  x" .. t.crew end
+                        end
+                        if e.lastTop ~= line1 then e.lastTop = line1; e.top.Text = line1 end
+                        if e.lastSub ~= line2 then e.lastSub = line2; e.sub.Text = line2 end
                     end
-                    if e.lastTop ~= line1 then e.lastTop = line1; e.top.Text = line1 end
-                    if e.lastSub ~= line2 then e.lastSub = line2; e.sub.Text = line2 end
+
+                    if e.col ~= colour then
+                        e.col = colour
+                        e.top.Color = colour
+                        e.sub.Color = colour
+                    end
+
+                    e.top.Position = Vector2.new(top.X,
+                        (topY and topY < 100000) and (topY - 18) or (top.Y - 18))
+                    e.top.Visible = true
+
+                    if e.lastSub and e.lastSub ~= "" then
+                        e.sub.Position = Vector2.new(top.X, bot.Y + 2)
+                        e.sub.Visible = true
+                    elseif e.sub.Visible then
+                        e.sub.Visible = false
+                    end
+                else
+                    if e.top.Visible then e.top.Visible = false end
+                    if e.sub.Visible then e.sub.Visible = false end
                 end
-                if e.col ~= colour then
-                    e.col = colour
-                    e.top.Color = colour
-                    e.sub.Color = colour
-                end
-                e.top.Position = Vector2.new(top.X,
-                    (topY and topY < 100000) and (topY - 18) or (top.Y - 18))
-                e.top.Visible = true
-                if e.lastSub and e.lastSub ~= "" then
-                    e.sub.Position = Vector2.new(top.X, bot.Y + 2)
-                    e.sub.Visible = true
-                elseif e.sub.Visible then
-                    e.sub.Visible = false
-                end
-            elseif e.top.Visible then
-                e.top.Visible = false
-                if e.sub.Visible then e.sub.Visible = false end
+            end)
+
+            if okEntry then
+                n = nextSlot
+            else
+                pcall(hideSlot, e)
             end
         end
     end
+
     if genShown > n then
-        for i = n + 1, genShown do hideSlot(genPool[i]) end
+        for i = n + 1, genShown do pcall(hideSlot, genPool[i]) end
     end
     genShown = n
     return n
 end
 
-local winPool, winList, winGeo = {}, {}, {}
 
 local trapPool, trapList = {}, {}
 local trapShown = 0
@@ -793,7 +848,11 @@ local function collectTraps()
 
     local function add(inst, armed)
         local id = trapAddress(inst)
-        local entry = id and trapIndex[id] or nil
+        -- Some executor wrappers expose Address inconsistently. Cache by the
+        -- instance itself when no numeric Address exists, avoiding a full
+        -- GetDescendants/geometry scan on every trap refresh.
+        local cacheKey = id or inst
+        local entry = trapIndex[cacheKey]
         if not entry then
             local center, hx, hy, hz, right, up, back = trapMeasure(inst)
             if not center then return end
@@ -817,7 +876,7 @@ local function collectTraps()
                 end
             end
         end
-        if id then nextIndex[id] = entry end
+        nextIndex[cacheKey] = entry
         out[#out + 1] = entry
     end
 
@@ -882,54 +941,73 @@ local function trapVictim(t)
     return best.self and "you" or best.name
 end
 
-local function trapLabel(t, dist)
-    local text = string.format("bear trap %dm", dist)
-    if t.armed == false then
-        local who = trapVictim(t)
-        text = text .. "  " .. (who and (who .. " trapped") or "trapped")
+local function updateTrapVictimLabels()
+    for i = 1, #trapList do
+        local t = trapList[i]
+        if t.armed == false then
+            t.victimName = trapVictim(t)
+        else
+            t.victimName = nil
+        end
     end
-    return text
 end
 
 local function drawTraps(camPos)
     local n = 0
+    local range = CFG.trapRange
+    local rangeSq = range * range
+
     for i = 1, #trapList do
         if n >= CFG.trapPool then break end
         local t = trapList[i]
-        local d = (t.pos - camPos).Magnitude
-        if d <= CFG.trapRange then
-            n = n + 1
-            local e = trapPool[n]
-            if not e then n = n - 1 break end
-            local colour = (t.armed == false) and CFG.trapSprungColour or CFG.trapArmedColour
-            local topY
-            if CFG.namesOnly then
-                hideBox(e)
-            else
-                topY = drawBox(e, t.pos, t.hx, t.hy, t.hz,
-                    t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
-                    colour, CFG.trapFill and CFG.trapFillA or nil, CFG.trapThick)
-            end
-            local top, okTop = WorldToScreen(t.pos + Vector3.new(0, t.hy + 1.2, 0))
-            if okTop and top and CFG.names then
-                local text = string.format("BEAR TRAP  %dm", math.floor(d + 0.5))
-                if t.armed == false then
-                    text = text .. "  " .. (trapVictim(t) or "TRAPPED")
+        local dx, dy, dz = t.pos.X - camPos.X, t.pos.Y - camPos.Y, t.pos.Z - camPos.Z
+        local d2 = dx * dx + dy * dy + dz * dz
+
+        if d2 <= rangeSq then
+            local nextSlot = n + 1
+            local e = trapPool[nextSlot]
+            if not e then break end
+
+            local okEntry = pcall(function()
+                local d = math.sqrt(d2)
+                local colour = (t.armed == false) and CFG.trapSprungColour or CFG.trapArmedColour
+                local topY
+
+                if CFG.namesOnly then
+                    hideBox(e)
+                else
+                    topY = drawBox(e, t.pos, t.hx, t.hy, t.hz,
+                        t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
+                        colour, CFG.trapFill and CFG.trapFillA or nil, CFG.trapThick)
                 end
-                if e.lastTop ~= text then e.lastTop = text; e.top.Text = text end
-                if e.col ~= colour then e.col = colour; e.top.Color = colour end
-                e.top.Position = Vector2.new(top.X,
-                    (topY and topY < 100000) and (topY - 16) or (top.Y - 16))
-                e.top.Visible = true
-            elseif e.top.Visible then
-                e.top.Visible = false
+
+                local top, okTop = WorldToScreen(t.pos + Vector3.new(0, t.hy + 1.2, 0))
+                if okTop and top and CFG.names then
+                    local text = string.format("BEAR TRAP  %dm", math.floor(d + 0.5))
+                    if t.armed == false then
+                        text = text .. "  " .. (t.victimName or "TRAPPED")
+                    end
+                    if e.lastTop ~= text then e.lastTop = text; e.top.Text = text end
+                    if e.col ~= colour then e.col = colour; e.top.Color = colour end
+                    e.top.Position = Vector2.new(top.X,
+                        (topY and topY < 100000) and (topY - 16) or (top.Y - 16))
+                    e.top.Visible = true
+                elseif e.top.Visible then
+                    e.top.Visible = false
+                end
+            end)
+
+            if okEntry then
+                n = nextSlot
+            else
+                -- Clear the damaged slot and continue with the next target.
+                pcall(hideSlot, e)
             end
         end
-        -- out of range: nothing is drawn for it, and the slots below n belong
-        -- to other traps. The tail loop after this hides what is left over.
     end
+
     if trapShown > n then
-        for i = n + 1, trapShown do hideSlot(trapPool[i]) end
+        for i = n + 1, trapShown do pcall(hideSlot, trapPool[i]) end
     end
     trapShown = n
     return n
@@ -1125,6 +1203,10 @@ local function scInputFor(name, fallback)
 end
 
 local scHeld = nil
+-- Fast Vault and Auto Skill Check share executor keyboard input.
+-- This lock prevents Sprint from being re-pressed during a skill-check tap.
+local vaultReleaseSprint
+local vaultInputBusy = false
 
 local function scReleaseInput()
     local held = scHeld
@@ -1136,13 +1218,17 @@ local function scReleaseInput()
 end
 
 local function scPress(input)
+    -- Avoid a held Sprint key interfering with a skill-check key press.
+    vaultInputBusy = true
+    if vaultReleaseSprint then pcall(vaultReleaseSprint) end
     scHeld = input
     local ok, err
     if input.mouse == 1 then ok, err = pcall(mouse1press)
     elseif input.mouse == 2 then ok, err = pcall(mouse2press)
     else ok, err = pcall(keypress, input.code) end
-    if ok then task.wait(0.02) end
+    if ok then pcall(task.wait, 0.02) end
     scReleaseInput()
+    vaultInputBusy = false
     return ok, err
 end
 
@@ -1507,7 +1593,7 @@ local function scStep()
     end
 end
 
--- Runtime: only generator ESP and bear-trap ESP remain enabled.
+-- Runtime: generator ESP, bear-trap ESP, Auto Skill Check, and Fast Vault.
 local running = true
 local camera = Workspace.CurrentCamera
 local connection
@@ -1534,7 +1620,7 @@ local function refreshWorld()
 
     if not CFG.gen then
         genList = {}
-    elseif not (genList[1] and stamp == genDiscoverStamp and os.clock() < genDiscoverAt) then
+    elseif stamp ~= genDiscoverStamp or os.clock() >= genDiscoverAt then
         genDiscoverStamp, genDiscoverAt = stamp, os.clock() + 30
         local found = collectGens()
         local kept = {}
@@ -1562,10 +1648,12 @@ local function refreshWorld()
             end
         end
 
-        ensureSlots(genPool, math.min(#kept, CFG.genPool), CFG.genThick, CFG.genText)
         genList = kept
         if not kept[1] then genDiscoverAt = os.clock() + 1.5 end
     end
+
+    ensureSlots(genPool, math.min(#genList, CFG.genPool),
+        CFG.genThick, CFG.genText, CFG.genFill)
 
     worldMs = worldMs * 0.8 + (os.clock() - started) * 1000 * 0.2
 end
@@ -1596,7 +1684,7 @@ connection = RunService.RenderStepped:Connect(function()
         local ok, err = pcall(drawGens, camPos, now)
         CFG.errGen = (not ok) and tostring(err) or nil
     elseif genShown > 0 then
-        for i = 1, genShown do hideSlot(genPool[i]) end
+        for i = 1, genShown do pcall(hideSlot, genPool[i]) end
         genShown = 0
     end
 
@@ -1604,7 +1692,7 @@ connection = RunService.RenderStepped:Connect(function()
         local ok, err = pcall(drawTraps, camPos)
         CFG.errTrap = (not ok) and tostring(err) or nil
     elseif trapShown > 0 then
-        for i = 1, trapShown do hideSlot(trapPool[i]) end
+        for i = 1, trapShown do pcall(hideSlot, trapPool[i]) end
         trapShown = 0
     end
 
@@ -1629,14 +1717,17 @@ task.spawn(function()
 end)
 
 task.spawn(function()
+    task.wait(0.35)
     while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
         if CFG.trap then
             local ok, list = pcall(collectTraps)
             if ok and list then
-                ensureSlots(trapPool, math.min(#list, CFG.trapPool), CFG.trapThick, CFG.trapText)
-                trapList = list
+                local slotOk = pcall(ensureSlots, trapPool,
+                    math.min(#list, CFG.trapPool), CFG.trapThick, CFG.trapText, CFG.trapFill)
+                if slotOk then trapList = list end
             end
             pcall(trapScanTrapped, os.clock())
+            pcall(updateTrapVictimLabels)
         elseif #trapList > 0 then
             trapList = {}
         end
@@ -1664,7 +1755,12 @@ _G.__GUILHERME_ZICA = API
 _G.__SWANGY = API -- legacy API alias
 
 API.gen = {}
-function API.gen.SetEnabled(on) CFG.gen = on and true or false; return CFG.gen end
+function API.gen.SetEnabled(on)
+    local enabled = on and true or false
+    if enabled and not CFG.gen then genDiscoverAt = 0 end
+    CFG.gen = enabled
+    return CFG.gen
+end
 function API.gen.Toggle() return API.gen.SetEnabled(not CFG.gen) end
 function API.gen.SetRange(v) CFG.genRange = math.max(1, tonumber(v) or CFG.genRange) end
 function API.gen.GetCount() return #genList end
@@ -1699,6 +1795,8 @@ function API.sc.Stats()
 end
 
 -- Fast Vault: Matcha-controlled values, disabled by default.
+-- Writes are event-driven: the GC scan happens on enable / refresh, and
+-- applygc is called only when a setting changes or a fresh cache is found.
 local VK_SHIFT = 0x10
 local VAULT_DEFAULTS = {
     DISTANCE = 3.5,
@@ -1709,6 +1807,9 @@ local VAULT_DEFAULTS = {
     SIDESTEP_TIME = 0.25,
 }
 local VAULT_KEYS = { "DISTANCE", "REPEAT_DISTANCE", "DOT", "MIN_SPEED", "ARRIVE_GRACE", "SIDESTEP_TIME" }
+local VAULT_KEY_SET = {}
+for i = 1, #VAULT_KEYS do VAULT_KEY_SET[VAULT_KEYS[i]] = true end
+
 local VAULT = {
     enabled = false, always = false, sprint = false, debug = false,
     dist = 1.5, rdist = 1.5, dot = 0.2, speed = 6.0, side = 0.6, grace = 0.3,
@@ -1719,26 +1820,21 @@ local VAULT_UI_VALUES = {
     vm_speed = 6.0, vm_side = 0.6, vm_grace = 0.3, vm_debug = false,
 }
 
-local vaultStatus
-pcall(function()
-    vaultStatus = Drawing.new("Text")
-    vaultStatus.Outline = true
-    vaultStatus.Center = false
-    vaultStatus.Color = Color3.fromRGB(255, 255, 255)
-    vaultStatus.Position = Vector2.new(20, 300)
-    vaultStatus.Transparency = 1
-    vaultStatus.Visible = false
-end)
-
 local vaultCache, vaultCounts, vaultVals = nil, {}, {}
+local vaultOriginal, vaultLastSent = {}, {}
 local vaultScanErr, vaultApplyErr, vaultSkipped = "", "", ""
-local vaultLastSent, vaultLastScan, vaultNeedVerify = {}, 0, false
+local vaultLastScan, vaultLastFullScan, vaultNextScanAt, vaultNextApplyAt = 0, 0, 0, 0
 local vaultWasEnabled, vaultSprintHeld = false, false
+local vaultRestorePending = false
+local vaultPartialScans = 0
+local vaultStatus, vaultStatusText = nil, ""
 
 local function vaultGetDesired()
     if VAULT.always then
-        return { DISTANCE = 0.1, REPEAT_DISTANCE = 0.1, DOT = -1,
-            MIN_SPEED = 0, ARRIVE_GRACE = 1, SIDESTEP_TIME = 5 }
+        return {
+            DISTANCE = 0.1, REPEAT_DISTANCE = 0.1, DOT = -1,
+            MIN_SPEED = 0, ARRIVE_GRACE = 1, SIDESTEP_TIME = 5,
+        }
     end
     return {
         DISTANCE = VAULT.dist, REPEAT_DISTANCE = VAULT.rdist, DOT = VAULT.dot,
@@ -1746,48 +1842,117 @@ local function vaultGetDesired()
     }
 end
 
-local function vaultScan()
-    vaultLastScan = tick()
+local function vaultScan(isRefresh)
+    local now = os.clock()
+    vaultLastScan = now
+
+    if type(getgc) ~= "function" then
+        vaultScanErr = "getgc unavailable"
+        vaultNextScanAt = now + (vaultCache and 30 or 1.5)
+        return false, false
+    end
+
     local ok, result = pcall(getgc, VAULT_KEYS)
-    vaultCounts, vaultVals = {}, {}
-    if ok and type(result) == "table" then
-        vaultCache, vaultScanErr = result, ""
-        for _, entry in ipairs(result) do
-            local okKey, key = pcall(function() return entry.key end)
-            local okValue, value = pcall(function() return entry.value end)
-            if okKey and key then
-                vaultCounts[key] = (vaultCounts[key] or 0) + 1
-                if vaultVals[key] == nil and okValue then vaultVals[key] = value end
+    if not ok or type(result) ~= "table" then
+        vaultScanErr = tostring(result or "getgc returned no table")
+        vaultNextScanAt = now + (vaultCache and 30 or 1.5)
+        return false, false
+    end
+
+    local counts, values = {}, {}
+    local matched = 0
+    for _, entry in pairs(result) do
+        local okKey, key = pcall(function() return entry.key end)
+        if okKey and VAULT_KEY_SET[key] then
+            counts[key] = (counts[key] or 0) + 1
+            matched = matched + 1
+            if values[key] == nil then
+                local okValue, value = pcall(function() return entry.value end)
+                if okValue then values[key] = value end
             end
         end
-    else
-        vaultCache, vaultScanErr = nil, tostring(result)
     end
+
+    if matched == 0 then
+        vaultScanErr = "no matching Fast Vault values found yet"
+        vaultNextScanAt = now + (vaultCache and 30 or 1.5)
+        return false, false
+    end
+
+    local hadCache = vaultCache ~= nil
+    vaultCache = result
+    vaultCounts, vaultVals = counts, values
+    vaultScanErr = ""
+
+    for key, value in pairs(values) do
+        -- Keep the first observed values as the true restore point. Do not
+        -- mistake our own modified values for the game's original settings.
+        if vaultOriginal[key] == nil then
+            if value ~= nil then
+                vaultOriginal[key] = value
+            else
+                vaultOriginal[key] = VAULT_DEFAULTS[key]
+            end
+        end
+    end
+
+    local complete = true
+    for i = 1, #VAULT_KEYS do
+        if (counts[VAULT_KEYS[i]] or 0) == 0 then complete = false break end
+    end
+
+    if not hadCache or isRefresh then
+        vaultLastSent = {}
+        vaultNextApplyAt = 0
+    end
+
+    if complete then
+        vaultPartialScans = 0
+        vaultLastFullScan = now
+        vaultNextScanAt = now + 60
+    else
+        vaultPartialScans = vaultPartialScans + 1
+        -- Retry missing entries a few times while the game initializes, then
+        -- back off to avoid repeatedly walking the GC during a match.
+        vaultNextScanAt = now + (vaultPartialScans <= 4 and 3 or 20)
+    end
+    return true, complete
 end
 
 local function vaultSend(values, force)
-    if not vaultCache then return end
-    local send, skipped, count = {}, {}, 0
-    for key, value in pairs(values) do
+    if not vaultCache or type(applygc) ~= "function" then
+        if type(applygc) ~= "function" then vaultApplyErr = "applygc unavailable" end
+        return false
+    end
+
+    local send, skipped = {}, {}
+    for i = 1, #VAULT_KEYS do
+        local key = VAULT_KEYS[i]
+        local value = values[key]
         local found = vaultCounts[key] or 0
         if found == 0 then
             skipped[#skipped + 1] = key .. "(none)"
-        elseif force or vaultLastSent[key] ~= value then
+        elseif value ~= nil and (force or vaultLastSent[key] ~= value) then
             send[key] = value
-            count = count + 1
         end
     end
     vaultSkipped = table.concat(skipped, " ")
-    if count > 0 then
-        local ok, err = pcall(applygc, vaultCache, send)
-        if ok then
-            vaultApplyErr = ""
-            for key, value in pairs(send) do vaultLastSent[key] = value end
-            if not force then vaultNeedVerify = true end
-        else
-            vaultApplyErr = tostring(err)
+
+    if next(send) == nil then return true end
+    local ok, result = pcall(applygc, vaultCache, send)
+    if ok and result ~= false then
+        vaultApplyErr = ""
+        for key, value in pairs(send) do
+            vaultLastSent[key] = value
+            vaultVals[key] = value
         end
+        vaultNextApplyAt = 0
+        return true
     end
+
+    vaultApplyErr = ok and "applygc returned false" or tostring(result)
+    vaultNextApplyAt = os.clock() + 1
+    return false
 end
 
 local function vaultFmt(value)
@@ -1797,87 +1962,144 @@ local function vaultFmt(value)
 end
 
 local function vaultUpdateStatus()
-    if not vaultStatus then return end
-    if VAULT.debug and VAULT.enabled then
-        local parts = {}
-        for _, key in ipairs(VAULT_KEYS) do
-            parts[#parts + 1] = key .. " x" .. (vaultCounts[key] or 0) .. "=" .. vaultFmt(vaultVals[key])
-        end
-        local line = table.concat(parts, "\n")
-        if not vaultCache then line = "getgc FAILED: " .. vaultScanErr end
-        if vaultSkipped ~= "" then line = line .. "\nskipped: " .. vaultSkipped end
-        if vaultApplyErr ~= "" then line = line .. "\napplygc ERROR: " .. vaultApplyErr end
-        vaultStatus.Text = line
-        vaultStatus.Visible = true
-    else
-        vaultStatus.Visible = false
+    if not VAULT.debug or not VAULT.enabled then
+        if vaultStatus then pcall(function() vaultStatus.Visible = false end) end
+        return
     end
+
+    if not vaultStatus then
+        local ok, drawing = pcall(Drawing.new, "Text")
+        if ok and drawing then
+            vaultStatus = drawing
+            pcall(function()
+                vaultStatus.Outline = true
+                vaultStatus.Center = false
+                vaultStatus.Color = Color3.fromRGB(255, 255, 255)
+                vaultStatus.Position = Vector2.new(20, 300)
+                vaultStatus.Transparency = 1
+                vaultStatus.Visible = false
+            end)
+        end
+    end
+    if not vaultStatus then return end
+
+    local parts = {}
+    for i = 1, #VAULT_KEYS do
+        local key = VAULT_KEYS[i]
+        parts[#parts + 1] = key .. " x" .. (vaultCounts[key] or 0) .. "=" .. vaultFmt(vaultVals[key])
+    end
+    local line = table.concat(parts, "\n")
+    if not vaultCache then line = "GC scan: " .. vaultScanErr end
+    if vaultSkipped ~= "" then line = line .. "\nskipped: " .. vaultSkipped end
+    if vaultApplyErr ~= "" then line = line .. "\napplygc: " .. vaultApplyErr end
+
+    if line ~= vaultStatusText then
+        vaultStatusText = line
+        pcall(function() vaultStatus.Text = line end)
+    end
+    pcall(function() vaultStatus.Visible = true end)
 end
 
-local function vaultReleaseSprint()
+vaultReleaseSprint = function()
     if vaultSprintHeld then
         pcall(keyrelease, VK_SHIFT)
         vaultSprintHeld = false
     end
 end
 
-local function vaultShutdown()
-    if vaultWasEnabled and vaultCache then
-        pcall(vaultSend, VAULT_DEFAULTS, true)
+local function vaultRestoreOriginal()
+    if not vaultCache then return false end
+    local restore = {}
+    for i = 1, #VAULT_KEYS do
+        local key = VAULT_KEYS[i]
+        if (vaultCounts[key] or 0) > 0 then
+            -- Restore the exact values observed before our first modification;
+            -- use the supplied defaults only as a fallback for missing snapshots.
+            restore[key] = vaultOriginal[key]
+            if restore[key] == nil then restore[key] = VAULT_DEFAULTS[key] end
+        end
     end
+    local restored = vaultSend(restore, true)
+    if restored then vaultLastSent = {} end
+    return restored
+end
+
+local function vaultShutdown()
+    if VAULT.enabled or vaultWasEnabled or vaultRestorePending then
+        pcall(vaultRestoreOriginal)
+    end
+    vaultRestorePending = false
+    vaultWasEnabled = false
+    VAULT.enabled = false
     vaultReleaseSprint()
     if vaultStatus then
         pcall(function() vaultStatus.Visible = false end)
         pcall(function() vaultStatus:Remove() end)
         vaultStatus = nil
+        vaultStatusText = ""
     end
 end
 
--- The Matcha widget values are restored on reinjection; this loop only runs
--- the vault logic while its dedicated toggle is enabled.
+-- One serialized worker owns all Fast Vault GC writes and Sprint key state.
+-- No 5-second forced reapply: that repeated write was a likely source of
+-- interference with the game's own vault logic.
 task.spawn(function()
-    local lastForce = 0
-    while running do
-        task.wait(0.2)
+    while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
+        task.wait(0.25)
         local ok, err = pcall(function()
-            local enabled = VAULT.enabled
-            if enabled and (not vaultWasEnabled or not vaultCache or tick() - vaultLastScan > 60) then
-                vaultScan()
-                lastForce = 0
-                vaultNeedVerify = true
-            end
+            local now = os.clock()
+            local enabled = VAULT.enabled == true
+
             if enabled then
-                local force = tick() - lastForce > 5
-                vaultSend(vaultGetDesired(), force)
-                if force then lastForce = tick() end
-            elseif vaultWasEnabled and vaultCache then
-                vaultSend(VAULT_DEFAULTS, true)
-                vaultLastSent = {}
+                if vaultRestorePending then
+                    -- A rapid off/on toggle cancels the pending restore and
+                    -- reapplies the selected Fast Vault values instead.
+                    vaultRestorePending = false
+                    vaultLastSent = {}
+                    vaultNextApplyAt = 0
+                end
+                if now >= vaultNextScanAt then
+                    local isRefresh = vaultCache ~= nil and (now - vaultLastFullScan) >= 60
+                    vaultScan(isRefresh)
+                end
+
+                if vaultCache and now >= vaultNextApplyAt then
+                    vaultSend(vaultGetDesired(), false)
+                end
+            elseif vaultWasEnabled then
+                vaultRestorePending = true
+                vaultReleaseSprint()
+            end
+
+            if not enabled and vaultRestorePending and now >= vaultNextApplyAt then
+                if vaultRestoreOriginal() then
+                    vaultRestorePending = false
+                end
             end
             vaultWasEnabled = enabled
-
-            if vaultNeedVerify and enabled and tick() - vaultLastScan > 2 then
-                vaultNeedVerify = false
-                vaultScan()
-            end
 
             local active = false
             if type(isrbxactive) == "function" then
                 local activeOk, activeValue = pcall(isrbxactive)
                 active = activeOk and activeValue == true
             end
-            local wantSprint = enabled and VAULT.sprint and active
+            local wantSprint = enabled and VAULT.sprint and active and not vaultInputBusy
             if wantSprint and not vaultSprintHeld then
-                pcall(keypress, VK_SHIFT)
-                vaultSprintHeld = true
+                local pressOk, pressResult = pcall(keypress, VK_SHIFT)
+                if pressOk and pressResult ~= false then
+                    vaultSprintHeld = true
+                end
             elseif not wantSprint then
                 vaultReleaseSprint()
             end
+
             vaultUpdateStatus()
         end)
         if not ok then
+            vaultApplyErr = tostring(err)
+            vaultNextApplyAt = os.clock() + 1
+            vaultReleaseSprint()
             if type(warn) == "function" then warn("[VaultMod] " .. tostring(err)) end
-            task.wait(1)
         end
     end
     vaultShutdown()
@@ -1900,472 +2122,6 @@ function API.unload()
 end
 API.stop = API.unload
 
-
--- parry: replicated windup attributes -> simulated right click
---
--- Every value here was measured live in this game on 2026-10-29, and each
--- one replaced something that did not work:
---   * the swing is LowerBodyStabilize + AC_AllowedSpeed in 20..40. The band
---     appears a poll BEFORE the stab flag, so the band alone is the trigger.
---     ac=nil and ac=3.62 locks exist and are rejected by the band.
---   * Players:GetPlayers and Players:GetChildren return empty mid-round, so
---     killers are found in Workspace by attributes only a killer carries.
---   * LocalPlayer's wrapper goes stale and CameraSubject is often a
---     CameraBlock Part, so your character is found by attributes only the
---     local client writes.
---   * the client cooldown token caches stale addresses and blocked five real
---     presses in a row, so it is not consulted at all. A press with the
---     dagger down is refused by the game at no cost.
---   * the press is mouse2click. No remote is ever sent.
---   * the whole gate set is cached at 5 Hz: eleven GetAttribute reads on the
---     press path measured as the reason a press landed too late.
-local PARRY = {
-    state = "Disabled", reason = nil, error = nil, denied = nil,
-    presses = 0, lands = 0, scans = 0,
-    lastPress = -100, lastCollect = 0, lastWindup = 0,
-    targets = {}, gate = { ok = false, reason = "starting", at = -1 },
-    charCache = nil, charAt = -1, rootCache = nil, rootAt = -1,
-}
-
--- Attributes only a KILLER character carries. Stalking is deliberately out:
--- a survivor was measured carrying Stalking=false.
-local PP_KILLER_ATTRS = {
-    "TerrorRadius", "ChaseTargetUserId", "BloodLust",
-    "MorphedKiller", "Butcher", "Beartraps",
-}
--- Attributes written by scripts on YOUR client only. Verified against the
--- killer and another survivor, whose lists contain none of them.
-local PP_SELF_ATTRS = {
-    "ParrySpent", "ParryLands", "Parry",
-    "RoundScriptsActive", "overridelookscript", "nogui",
-}
-
-PARRY.actions = { "action", "isVaulting", "isSliding", "isDroppingPallet",
-    "isRepairing", "isHealing", "isUnhooking", "isExiting" }
-PARRY.blocked = { "Knocked", "IsHooked", "IsCarried", "IsDead", "Trapped" }
-
-function PARRY.addr(inst)
-    if not inst then return nil end
-    local ok, a = pcall(function() return inst.Address end)
-    if ok and type(a) == "number" and a ~= 0 then return tostring(a) end
-    return tostring(inst)
-end
-
-function PARRY.same(a, b)
-    if not a or not b then return false end
-    local x, y = PARRY.addr(a), PARRY.addr(b)
-    if x and y and x == y then return true end
-    local n1, n2 = nil, nil
-    pcall(function() n1 = a.Name end)
-    pcall(function() n2 = b.Name end)
-    return n1 ~= nil and n1 == n2
-end
-
--- Your character, without Players and without trusting the camera subject.
-function PARRY.myChar()
-    local now = os.clock()
-    if PARRY.charCache and now - PARRY.charAt < 0.5 and PARRY.charCache.Parent then
-        return PARRY.charCache
-    end
-    PARRY.charAt = now
-    local prev = PARRY.charCache
-    PARRY.charCache = nil
-
-    local cam = nil
-    pcall(function() cam = Workspace.CurrentCamera end)
-    if cam then
-        local subj = nil
-        pcall(function() subj = cam.CameraSubject end)
-        if subj then
-            local model = nil
-            pcall(function()
-                model = subj.Parent
-                if model and model.ClassName ~= "Model" then model = model.Parent end
-            end)
-            if model and model.ClassName == "Model" then PARRY.charCache = model end
-        end
-    end
-
-    if not PARRY.charCache and lp then
-        local okP, ch = pcall(function() return lp.Character end)
-        if okP and ch then PARRY.charCache = ch end
-    end
-
-    if not PARRY.charCache then
-        local ok, kids = pcall(function() return Workspace:GetChildren() end)
-        if ok and type(kids) == "table" then
-            local camPos = nil
-            pcall(function() camPos = Workspace.CurrentCamera.CFrame.Position end)
-            local best, bestD = nil, nil
-            for i = 1, #kids do
-                local m = kids[i]
-                if m.ClassName == "Model" then
-                    local hum = nil
-                    pcall(function() hum = m:FindFirstChildOfClass("Humanoid") end)
-                    if hum then
-                        local mine = false
-                        for j = 1, #PP_SELF_ATTRS do
-                            local v = nil
-                            pcall(function() v = m:GetAttribute(PP_SELF_ATTRS[j]) end)
-                            if v ~= nil then mine = true break end
-                        end
-                        if mine then
-                            PARRY.charCache = m
-                            break
-                        end
-                        local root = nil
-                        pcall(function() root = m:FindFirstChild("HumanoidRootPart") end)
-                        if root and camPos then
-                            local d = nil
-                            pcall(function() d = (root.Position - camPos).Magnitude end)
-                            if d and d < 6 and (not bestD or d < bestD) then best, bestD = m, d end
-                        end
-                    end
-                end
-            end
-            if not PARRY.charCache and best then PARRY.charCache = best end
-        end
-    end
-
-    if not PARRY.charCache and prev then
-        local alive = false
-        pcall(function() alive = prev.Parent ~= nil end)
-        if alive then PARRY.charCache = prev end
-    end
-    return PARRY.charCache
-end
-
-function PARRY.myRoot()
-    local now = os.clock()
-    if PARRY.rootCache and now - PARRY.rootAt < 0.25 and PARRY.rootCache.Parent then
-        return PARRY.rootCache
-    end
-    PARRY.rootAt = now
-    PARRY.rootCache = nil
-    local ch = PARRY.myChar()
-    if ch then
-        local ok, root = pcall(function() return ch:FindFirstChild("HumanoidRootPart") end)
-        if ok then PARRY.rootCache = root end
-    end
-    return PARRY.rootCache
-end
-
-function PARRY.distance(a, b)
-    if not a or not b then return nil end
-    local d = nil
-    pcall(function() d = (a.Position - b.Position).Magnitude end)
-    return d
-end
-
-function PARRY.ping()
-    if type(GetPingValue) == "function" then
-        local ok, v = pcall(GetPingValue)
-        if ok and type(v) == "number" then return v end
-    end
-    return 0
-end
-
-function PARRY.range()
-    local r = CFG.ppRange or 14
-    if CFG.ppPing then r = r + PARRY.ping() * 0.015 end
-    return math.max(r, CFG.ppMinRange or 13)
-end
-
-function PARRY.dagger()
-    local ch = PARRY.myChar()
-    local pack = nil
-    if lp then pcall(function() pack = lp:FindFirstChildOfClass("Backpack") end) end
-    for _, holder in ipairs({ ch, pack }) do
-        if holder then
-            for _, name in ipairs({ "Parrying Dagger", "Parry Dagger" }) do
-                local t = nil
-                pcall(function() t = holder:FindFirstChild(name) end)
-                if t then return t end
-            end
-            local ok, kids = pcall(function() return holder:GetChildren() end)
-            if ok and kids then
-                for i = 1, #kids do
-                    local n = string.lower(tostring(kids[i].Name))
-                    if n:find("dagger", 1, true) or n:find("parry", 1, true) then
-                        return kids[i]
-                    end
-                end
-            end
-        end
-    end
-end
-
-function PARRY.equip()
-    local ch = PARRY.myChar()
-    local tool = PARRY.dagger()
-    if not ch or not tool or PARRY.same(tool.Parent, ch) then return end
-    local hum = nil
-    pcall(function() hum = ch:FindFirstChildOfClass("Humanoid") end)
-    pcall(function()
-        tool.Parent = ch
-        if hum then task.spawn(function() hum:EquipTool(tool) end) end
-    end)
-end
-
-function PARRY.facing(kRoot, myRoot)
-    local delta = PARRY.distance(kRoot, myRoot)
-    if not delta or delta < 0.05 then return true end
-    local dir = nil
-    pcall(function() dir = (myRoot.Position - kRoot.Position).Unit end)
-    if not dir then return true end
-    local look = nil
-    pcall(function() look = kRoot.CFrame.LookVector end)
-    if look and look:Dot(dir) > -0.1 then return true end
-    return false
-end
-
--- Gates cached at 5 Hz. Each GetAttribute measured ~606us here.
-function PARRY.refreshGates()
-    local now = os.clock()
-    if now - PARRY.gate.at < 0.2 then return end
-    PARRY.gate.at = now
-    local ch = PARRY.myChar()
-    if not ch then PARRY.gate.ok = false PARRY.gate.reason = "no character" return end
-
-    local hum = nil
-    pcall(function() hum = ch:FindFirstChildOfClass("Humanoid") end)
-    local hmax, hp = nil, nil
-    pcall(function() hmax = hum and hum.MaxHealth end)
-    pcall(function() hp = hum and hum.Health end)
-    if type(hmax) == "number" and hmax > 0 and type(hp) == "number"
-        and hp < hmax * ((CFG.ppHealth or 50) / 100) then
-        PARRY.gate.ok = false PARRY.gate.reason = "health too low" return
-    end
-
-    for i = 1, #PARRY.blocked do
-        local v = nil
-        pcall(function() v = ch:GetAttribute(PARRY.blocked[i]) end)
-        if v == true then
-            PARRY.gate.ok = false
-            PARRY.gate.reason = "unavailable (" .. PARRY.blocked[i] .. ")"
-            return
-        end
-    end
-
-    local interact = nil
-    pcall(function() interact = ch:FindFirstChild("CheckInterractable") end)
-    if interact then
-        for i = 1, #PARRY.actions do
-            local v = nil
-            pcall(function() v = interact:GetAttribute(PARRY.actions[i]) end)
-            if v == true then PARRY.gate.ok = false PARRY.gate.reason = "waiting for action" return end
-        end
-    end
-
-    if not PARRY.dagger() then PARRY.gate.ok = false PARRY.gate.reason = "no dagger" return end
-
-    PARRY.gate.ok = true
-    PARRY.gate.reason = "ready"
-end
-
-function PARRY.press(reason, distance)
-    if not running or not CFG.pp then return false end
-    PARRY.refreshGates()
-    if not PARRY.gate.ok then
-        PARRY.state = PARRY.gate.reason
-        PARRY.denied = PARRY.gate.reason
-        return false
-    end
-
-    local now = os.clock()
-    if now - PARRY.lastPress < (CFG.ppInterval or 0.45) then
-        PARRY.denied = "press interval"
-        return false
-    end
-
-    PARRY.lastPress = now
-    PARRY.denied = nil
-    PARRY.presses = PARRY.presses + 1
-    PARRY.reason = reason
-    PARRY.state = "pressed: " .. tostring(reason)
-
-    -- Click first: the swing's lead is the budget, not a dagger re-equip.
-    pcall(function() setrobloxinput(true) end)
-    if type(mouse2click) == "function" then pcall(mouse2click) end
-
-    if CFG.ppEquip then task.spawn(PARRY.equip) end
-
-    -- The game's own "the parry connected" flag, 350 ms later.
-    task.spawn(function()
-        task.wait(0.35)
-        local ch = PARRY.myChar()
-        if not ch then return end
-        local lands = nil
-        pcall(function() lands = ch:GetAttribute("ParryLands") end)
-        if lands == 1 or lands == true then
-            PARRY.lands = PARRY.lands + 1
-            PARRY.state = "parried"
-        end
-    end)
-    return true
-end
-
-function PARRY.collect(now)
-    local fresh = {}
-    local mine = PARRY.myChar()
-    local ok, kids = pcall(function() return Workspace:GetChildren() end)
-    if ok and type(kids) == "table" then
-        for i = 1, #kids do
-            local model = kids[i]
-            if model.ClassName == "Model" and not PARRY.same(model, mine) then
-                local root = nil
-                pcall(function() root = model:FindFirstChild("HumanoidRootPart") end)
-                local hum = nil
-                pcall(function() hum = model:FindFirstChildOfClass("Humanoid") end)
-                if root and hum then
-                    local killer = false
-                    for j = 1, #PP_KILLER_ATTRS do
-                        local v = nil
-                        pcall(function() v = model:GetAttribute(PP_KILLER_ATTRS[j]) end)
-                        if v ~= nil then killer = true break end
-                    end
-                    if killer then
-                        local key = PARRY.addr(model)
-                        local t = PARRY.targets[key]
-                        if not t then
-                            t = { char = model }
-                            PARRY.targets[key] = t
-                        end
-                        t.char = model
-                        t.root = root
-                        t.interact = model:FindFirstChild("CheckInterractable")
-                        fresh[key] = true
-                    end
-                end
-            end
-        end
-    end
-    for key, t in pairs(PARRY.targets) do
-        local alive = false
-        pcall(function() alive = t.char ~= nil and t.char.Parent ~= nil end)
-        if not fresh[key] or not alive then PARRY.targets[key] = nil end
-    end
-end
-
--- The trigger. AC_AllowedSpeed in 20..40 is the swing; the stab flag follows
--- it by a poll and waiting for it only burns lead.
-function PARRY.windup(t, distance, myRoot)
-    local stab, allowed = nil, nil
-    pcall(function() stab = t.char:GetAttribute("LowerBodyStabilize") end)
-    pcall(function() allowed = t.char:GetAttribute("AC_AllowedSpeed") end)
-
-    local active = type(allowed) == "number" and allowed >= 20 and allowed <= 40
-    if not active then
-        t.windupFired = false
-        return
-    end
-    if t.windupFired then return end
-    if distance > PARRY.range() then return end
-    if CFG.ppFacing and t.root and myRoot and not PARRY.facing(t.root, myRoot) then return end
-
-    t.windupFired = true
-    if CFG.ppAim and t.root then
-        task.spawn(function()
-            local cam = nil
-            pcall(function() cam = Workspace.CurrentCamera end)
-            if not cam then return end
-            local pos, target = nil, nil
-            pcall(function() pos = cam.CFrame.Position end)
-            pcall(function() target = t.root.Position end)
-            if pos and target then pcall(function() cam.CFrame = CFrame.new(pos, target) end) end
-        end)
-    end
-    PARRY.press("windup", distance)
-end
-
-function PARRY.step()
-    if not CFG.pp then PARRY.state = "Disabled" return end
-    local now = os.clock()
-    if now >= PARRY.lastCollect + 1 then
-        PARRY.lastCollect = now
-        PARRY.collect(now)
-    end
-
-    -- keep the status honest even when no swing is happening
-    pcall(PARRY.refreshGates)
-
-    local windupDue = CFG.ppWindup and now >= PARRY.lastWindup + 1 / (CFG.ppWindupHz or 120)
-    if windupDue then PARRY.lastWindup = now end
-
-    local myRoot = PARRY.myRoot()
-    local hadPress = PARRY.presses
-    for _, t in pairs(PARRY.targets) do
-        local live = false
-        pcall(function() live = t.root ~= nil and t.root.Parent ~= nil end)
-        if live and myRoot then
-            local distance = PARRY.distance(t.root, myRoot)
-            if distance and distance <= (CFG.ppScanRange or 70) then
-                PARRY.scans = PARRY.scans + 1
-                if windupDue then
-                    local ok, err = pcall(PARRY.windup, t, distance, myRoot)
-                    if not ok then PARRY.error = tostring(err) end
-                end
-            end
-        end
-    end
-
-    if PARRY.presses == hadPress and PARRY.state ~= "parried" then
-        if not myRoot then
-            PARRY.state = "waiting for character"
-        elseif PARRY.gate.ok or PARRY.denied == nil then
-            PARRY.state = "watching"
-        else
-            PARRY.state = PARRY.denied or "watching"
-        end
-    end
-end
-
-task.spawn(function()
-    while running do
-        if CFG.pp then
-            local ok, err = pcall(PARRY.step)
-            if not ok then
-                PARRY.state = "read error"
-                PARRY.error = tostring(err)
-            end
-        end
-        task.wait(1 / (CFG.ppHz or 120))
-    end
-end)
-
-task.spawn(function()
-    while running do
-        if CFG.pp and CFG.ppEquip then
-            local myRoot = PARRY.myRoot()
-            if myRoot then
-                for _, t in pairs(PARRY.targets) do
-                    local d = PARRY.distance(t.root, myRoot)
-                    if d and d <= (CFG.ppEquipRange or 45) then
-                        PARRY.equip()
-                        break
-                    end
-                end
-            end
-        end
-        task.wait(0.5)
-    end
-end)
-
-function API.ParryStatus()
-    local n = 0
-    for _ in pairs(PARRY.targets) do n = n + 1 end
-    return {
-        enabled = CFG.pp, state = PARRY.state, presses = PARRY.presses,
-        lands = PARRY.lands, scans = PARRY.scans, targets = n,
-        denied = PARRY.denied, reason = PARRY.reason, error = PARRY.error,
-        gate = PARRY.gate.reason,
-    }
-end
-function API.SetParry(on)
-    CFG.pp = on and true or false
-    if not CFG.pp then PARRY.state = "Disabled" end
-    return CFG.pp
-end
 
 -- Matcha UI: the only control surface for the retained features.
 -- Uses the documented UI.AddTab / Section / Toggle / SliderInt API.
@@ -2392,12 +2148,9 @@ local function buildMatchaUI()
         sc_delay = CFG.scDelay,
         gen_range = CFG.genRange,
         trap_range = CFG.trapRange,
+        gen_fill = CFG.genFill,
+        trap_fill = CFG.trapFill,
         sc_lead = CFG.scLead,
-        pp_on = CFG.pp,
-        pp_range = CFG.ppRange,
-        pp_health = CFG.ppHealth,
-        pp_windup = CFG.ppWindup,
-        pp_equip = CFG.ppEquip,
         vm_enabled = VAULT_UI_VALUES.vm_enabled,
         vm_always = VAULT_UI_VALUES.vm_always,
         vm_sprint = VAULT_UI_VALUES.vm_sprint,
@@ -2432,12 +2185,9 @@ local function buildMatchaUI()
         sc_delay = function(v) CFG.scDelay = math.clamp(tonumber(v) or 0, 0, 300) end,
         gen_range = function(v) API.gen.SetRange(v) end,
         trap_range = function(v) API.trap.SetRange(v) end,
+        gen_fill = function(v) CFG.genFill = v == true end,
+        trap_fill = function(v) CFG.trapFill = v == true end,
         sc_lead = function(v) API.sc.SetLead(v) end,
-        pp_on = function(v) API.SetParry(v == true) end,
-        pp_range = function(v) CFG.ppRange = math.clamp(tonumber(v) or CFG.ppRange, 4, 25) end,
-        pp_health = function(v) CFG.ppHealth = math.clamp(tonumber(v) or CFG.ppHealth, 10, 100) end,
-        pp_windup = function(v) CFG.ppWindup = v == true end,
-        pp_equip = function(v) CFG.ppEquip = v == true end,
         vm_enabled = function(v) VAULT.enabled = v == true end,
         vm_always = function(v) VAULT.always = v == true end,
         vm_sprint = function(v) VAULT.sprint = v == true end,
@@ -2492,8 +2242,10 @@ local function buildMatchaUI()
         local esp = addSection(tab, "ESP", "Left")
         addToggle(esp, "sw_gen", "Generator ESP")
         addSlider(esp, "gen_range", "Generator range", 50, 10000)
+        addToggle(esp, "gen_fill", "Generator fill (higher GPU/CPU cost)")
         addToggle(esp, "sw_trap", "Bear Trap ESP")
         addSlider(esp, "trap_range", "Bear Trap range", 50, 10000)
+        addToggle(esp, "trap_fill", "Bear Trap fill (higher GPU/CPU cost)")
 
         local skill = addSection(tab, "Auto Skill Check — Gen + Butcher Trap", "Right")
         addToggle(skill, "sc_on", "Auto Skill Check (automatic mode)")
@@ -2505,14 +2257,6 @@ local function buildMatchaUI()
         addSlider(skill, "sc_hum_max", "Humanize maximum ms", 0, 500)
         addSlider(skill, "sc_react", "Reaction delay ms", 0, 300)
         addSlider(skill, "sc_delay", "Click delay ms", 0, 300)
-
-        local parry = addSection(tab, "Auto Parry", "Left")
-        addToggle(parry, "pp_on", "Auto Parry")
-        addSlider(parry, "pp_range", "Parry range", 4, 25)
-        addSlider(parry, "pp_health", "Minimum health %", 10, 100)
-        addToggle(parry, "pp_windup", "Windup detection")
-        addToggle(parry, "pp_equip", "Auto-equip parrying dagger")
-        addWidget(parry, "Text", "Uses the original killer windup detection and simulated right-click parry.")
 
         local vault = addSection(tab, "Fast Vault", "Right")
         addToggle(vault, "vm_enabled", "Enable Fast Vault")
@@ -2526,12 +2270,12 @@ local function buildMatchaUI()
         addFloatSlider(vault, "vm_side", "Sidestep Time", 0.25, 5.0, "%.2f")
         addFloatSlider(vault, "vm_grace", "Arrive Grace", 0.12, 1.0, "%.2f")
         addToggle(vault, "vm_debug", "Show Debug Line")
-        addWidget(vault, "Text", "Turning Fast Vault off restores the original default values.")
+        addWidget(vault, "Text", "Turning Fast Vault off restores the values captured before the first change.")
 
         local scope = addSection(tab, "Original feature scope", "Left")
         addWidget(scope, "Text", "Auto Skill Check covers generator checks and butcher-trap checks. Neutral rescue is a timing fallback, not a separate player-rescue action.")
         addWidget(scope, "Text", "The original source has no dedicated automatic generator-repair or player-healing routine.")
-        addWidget(scope, "Text", "The separate floating HUD remains removed; controls stay in this Matcha tab.")
+        addWidget(scope, "Text", "The separate floating HUD has been removed; controls stay in this Matcha tab.")
         addWidget(scope, "Button", "Unload GUILHERME ZICA", function()
             pcall(API.unload)
         end)
