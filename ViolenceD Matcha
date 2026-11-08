@@ -1689,12 +1689,26 @@ end)
 
 do
     local keys = {"DISTANCE", "REPEAT_DISTANCE", "DOT", "MIN_SPEED", "ARRIVE_GRACE", "SIDESTEP_TIME"}
-    local gameDefaults = {DISTANCE = 3.5, REPEAT_DISTANCE = 4, DOT = .7071067811865476, MIN_SPEED = 12.5, ARRIVE_GRACE = .12, SIDESTEP_TIME = .25}
-    local maxPreset = {DISTANCE = .1, REPEAT_DISTANCE = .1, DOT = -1, MIN_SPEED = 0, ARRIVE_GRACE = 1, SIDESTEP_TIME = 5}
-    local checkInterval = .5
-    local tolerance = .006
+    local gameDefaults = {
+        DISTANCE = 3.5,
+        REPEAT_DISTANCE = 4,
+        DOT = 0.7071067811865476,
+        MIN_SPEED = 12.5,
+        ARRIVE_GRACE = 0.12,
+        SIDESTEP_TIME = 0.25,
+    }
+    local maxPreset = {
+        DISTANCE = 0.1,
+        REPEAT_DISTANCE = 0.1,
+        DOT = -1,
+        MIN_SPEED = 0,
+        ARRIVE_GRACE = 1,
+        SIDESTEP_TIME = 5,
+    }
+    local checkInterval = 0.5
+    local tolerance = 0.006
     local clusterSpan = 0x400
-
+    local localPlayer = Players.LocalPlayer
 
     local function Matches(value, target)
         value = tonumber(value)
@@ -1706,20 +1720,30 @@ do
     end
 
     local function Cluster(numeric)
-        table.sort(numeric, function(a, b) return a.Addr < b.Addr end)
+        table.sort(numeric, function(a, b)
+            return a.Addr < b.Addr
+        end)
+
         for first = 1, #numeric do
-            local picked, count = {}, 0
+            local picked = {}
+            local count = 0
             for index = first, #numeric do
-                local entry = numeric[index]
-                if entry.Addr - numeric[first].Addr > clusterSpan then break end
-                if not picked[entry.Entry.key] then
-                    picked[entry.Entry.key] = entry.Entry
+                local item = numeric[index]
+                if item.Addr - numeric[first].Addr > clusterSpan then
+                    break
+                end
+                local key = item.Entry.key
+                if key and not picked[key] then
+                    picked[key] = item.Entry
                     count += 1
                 end
             end
+
             if count == #keys then
                 local entries = {}
-                for _, key in keys do entries[#entries + 1] = picked[key] end
+                for _, key in keys do
+                    entries[#entries + 1] = picked[key]
+                end
                 return entries, "grouped"
             end
         end
@@ -1727,78 +1751,151 @@ do
     end
 
     local function Scan(desired)
+        if type(getgc) ~= "function" then
+            print("[MatchaVD] fast vault: getgc is unavailable")
+            return nil
+        end
+
         local ok, result = pcall(getgc, keys)
         if not ok or type(result) ~= "table" then
             print("[MatchaVD] fast vault: getgc failed: " .. tostring(result))
             return nil
         end
+
         local numeric = {}
         for _, entry in result do
             local addr = tonumber(entry.addr)
-            if entry.type == "number" and addr then numeric[#numeric + 1] = {Entry = entry, Addr = addr} end
+            if entry.type == "number" and addr and entry.key then
+                numeric[#numeric + 1] = {Entry = entry, Addr = addr}
+            end
         end
+
         local entries, how = Cluster(numeric)
         if not entries then
-            local applied = _G.MatchaVDVaultApplied or {}
+            local alreadyApplied = _G.MatchaVDVaultApplied or {}
             entries, how = {}, "by value"
             for _, item in numeric do
                 local entry = item.Entry
                 local key = entry.key
-                if Matches(entry.value, gameDefaults[key]) or Matches(entry.value, desired[key]) or Matches(entry.value, applied[key]) then
+                if gameDefaults[key] ~= nil
+                    and (Matches(entry.value, gameDefaults[key])
+                        or Matches(entry.value, desired[key])
+                        or Matches(entry.value, alreadyApplied[key])) then
                     entries[#entries + 1] = entry
                 end
             end
         end
+
         local found = {}
-        for _, entry in entries do found[entry.key] = (found[entry.key] or 0) + 1 end
+        for _, entry in entries do
+            found[entry.key] = (found[entry.key] or 0) + 1
+        end
         local summary = {}
-        for _, key in keys do summary[#summary + 1] = key .. " x" .. (found[key] or 0) end
         local distinct = 0
         for _, key in keys do
-            if found[key] then distinct += 1 end
+            local count = found[key] or 0
+            summary[#summary + 1] = key .. " x" .. count
+            if count > 0 then
+                distinct += 1
+            end
         end
-        local success = distinct == #keys and #entries >= #keys
-        if not success then print(string.format("[MatchaVD] fast vault scan failed (%s, %d of %d entries): %s", how, #entries, #result, table.concat(summary, ", "))) end
-        return if success then entries else nil
+
+        if distinct ~= #keys or #entries < #keys then
+            print(string.format(
+                "[MatchaVD] fast vault scan failed (%s, %d/%d entries): %s",
+                tostring(how), #entries, #result, table.concat(summary, ", ")
+            ))
+            return nil
+        end
+
+        print(string.format("[MatchaVD] fast vault cache found (%s, %d refs)", tostring(how), #entries))
+        return entries
+    end
+
+    local function CacheAlreadyMatches(entries, values)
+        local found = {}
+        for _, entry in entries do
+            local target = values[entry.key]
+            if target ~= nil then
+                if not Matches(entry.value, target) then
+                    return false
+                end
+                found[entry.key] = true
+            end
+        end
+        for _, key in keys do
+            if not found[key] then
+                return false
+            end
+        end
+        return true
     end
 
     local function Apply(entries, values)
-        local ok, err = pcall(applygc, entries, values)
-        if not ok then
-            print("[MatchaVD] fast vault: applygc failed: " .. tostring(err))
+        if type(applygc) ~= "function" then
+            print("[MatchaVD] fast vault: applygc is unavailable")
             return false
         end
-        _G.MatchaVDVaultApplied = values
+
+        local ok, changed = pcall(applygc, entries, values)
+        if not ok then
+            print("[MatchaVD] fast vault: applygc failed: " .. tostring(changed))
+            return false
+        end
+
+        -- A zero count can mean the cache already contains the requested values.
+        if type(changed) == "number" and changed <= 0 and not CacheAlreadyMatches(entries, values) then
+            print("[MatchaVD] fast vault: applygc changed 0 values; cache will be refreshed")
+            return false
+        end
+
+        _G.MatchaVDVaultApplied = table.clone(values)
+        if type(changed) == "number" then
+            print("[MatchaVD] fast vault: applygc updated " .. tostring(changed) .. " values")
+        end
         return true
     end
 
     local function SameValues(a, b)
-        if not a or not b then return false end
+        if not a or not b then
+            return false
+        end
         for _, key in keys do
-            if not Matches(a[key], b[key]) then return false end
+            if not Matches(a[key], b[key]) then
+                return false
+            end
         end
         return true
     end
 
     local session = _G.MatchaVDVaultScan
-    if not session or session.JobId ~= game.JobId then
+    if type(session) ~= "table" or session.JobId ~= game.JobId then
         session = {JobId = game.JobId}
         _G.MatchaVDVaultScan = session
     end
+
     local entries = session.Entries
-    local requested = false
-    local nextApply = 0
-    local lastCharacterAddress = Players.LocalPlayer.Character and Players.LocalPlayer.Character.Address
-    if entries and (not session.CharacterAddress or not lastCharacterAddress
-        or session.CharacterAddress ~= lastCharacterAddress) then
+    local currentCharacter = localPlayer.Character
+    local lastCharacterAddress = currentCharacter and currentCharacter.Address
+    if entries and lastCharacterAddress
+        and (not session.CharacterAddress or session.CharacterAddress ~= lastCharacterAddress) then
         entries = nil
-        session.Entries, session.Written = nil, nil
-        vault.NeedsRefresh = true
+        session.Entries = nil
+        session.Written = nil
     end
-    vault.Ready = entries ~= nil and not vault.NeedsRefresh
+
+    vault.NeedsRefresh = entries == nil
+    vault.Ready = entries ~= nil
+    local requested = entries == nil
+    local scanAt = if requested then tick() + 1.5 else math.huge
+    local failedScans = 0
+    local applyFailures = 0
+    local nextApply = 0
 
     local popup = Drawing.new("Text")
-    if textFont then popup.Font = textFont end
+    if textFont then
+        popup.Font = textFont
+    end
     popup.Size = 20
     popup.Center = true
     popup.Outline = true
@@ -1808,64 +1905,145 @@ do
     allDrawings[#allDrawings + 1] = popup
 
     local function ScanWithPopup()
+        if vault.Scanning then
+            return false
+        end
+
         vault.Scanning = true
-        local camera = workspace.CurrentCamera
-        local size = camera and camera.ViewportSize
-        if size then popup.Position = Vector2.new(math.floor(size.X / 2), math.floor(size.Y / 2 - 40)) end
-        popup.Visible = true
-        Sleep(.2)
-        local scanOk, refreshed = pcall(Scan, Desired())
+        local scanOk, refreshed = pcall(function()
+            local camera = workspace.CurrentCamera
+            local size = camera and camera.ViewportSize
+            if size then
+                popup.Position = Vector2.new(math.floor(size.X / 2), math.floor(size.Y / 2 - 40))
+            end
+            popup.Visible = true
+            Sleep(0.2)
+            return Scan(Desired())
+        end)
+
+        pcall(function()
+            popup.Visible = false
+        end)
+        vault.Scanning = false
+
         if not scanOk then
             print("[MatchaVD] fast vault scan error: " .. tostring(refreshed))
             refreshed = nil
         end
+
         if refreshed then
             entries = refreshed
             session.Entries = refreshed
-            session.CharacterAddress = Players.LocalPlayer.Character and Players.LocalPlayer.Character.Address
+            local character = localPlayer.Character
+            session.CharacterAddress = character and character.Address
             session.Written = nil
             vault.NeedsRefresh = false
+            vault.Ready = true
             print("[MatchaVD] fast vault cache refreshed")
-        elseif not entries then
+        else
+            entries = nil
             session.Entries = nil
+            session.Written = nil
             vault.NeedsRefresh = true
+            vault.Ready = false
         end
-        pcall(function() popup.Visible = false end)
-        vault.Scanning = false
-        vault.Ready = entries ~= nil and not vault.NeedsRefresh
+        return refreshed ~= nil
     end
 
     vault.ScanNow = function()
-        if not vault.Scanning then requested = true end
+        if not vault.Scanning then
+            entries = nil
+            session.Entries = nil
+            session.Written = nil
+            vault.Ready = false
+            vault.NeedsRefresh = true
+            requested = true
+            scanAt = tick() + 0.25
+            failedScans = 0
+        end
     end
 
     AddJob("Fast vault", false, function()
         while Running() do
-            local character = Players.LocalPlayer.Character
+            local now = tick()
+            local character = localPlayer.Character
             local characterAddress = character and character.Address
-            if lastCharacterAddress and characterAddress and characterAddress ~= lastCharacterAddress then
+
+            local firstCharacterSeen = characterAddress and not lastCharacterAddress
+            local characterChanged = characterAddress and (
+                (lastCharacterAddress and characterAddress ~= lastCharacterAddress)
+                or (firstCharacterSeen and entries ~= nil
+                    and session.CharacterAddress ~= characterAddress)
+            )
+            if characterChanged then
                 entries = nil
                 session.Entries = nil
                 session.Written = nil
                 vault.Ready = false
                 vault.NeedsRefresh = true
-                print("[MatchaVD] character changed; press Refresh fast vault cache")
+                requested = true
+                scanAt = now + 1.5
+                failedScans = 0
+                applyFailures = 0
+                print("[MatchaVD] character changed; fast vault cache will refresh automatically")
+            elseif firstCharacterSeen and not entries and not requested then
+                requested = true
+                scanAt = now + 1.5
+                failedScans = 0
+                print("[MatchaVD] character loaded; starting fast vault scan")
             end
-            if characterAddress then lastCharacterAddress = characterAddress end
+            if characterAddress then
+                lastCharacterAddress = characterAddress
+            end
 
-            if requested then
+            if requested and now >= scanAt and not vault.Scanning then
                 requested = false
-                ScanWithPopup()
+                local scanCallOk, scanSucceeded = pcall(ScanWithPopup)
+                if not scanCallOk then
+                    vault.Scanning = false
+                    pcall(function()
+                        popup.Visible = false
+                    end)
+                    print("[MatchaVD] fast vault worker recovered: " .. tostring(scanSucceeded))
+                    scanSucceeded = false
+                end
+                if not scanSucceeded then
+                    failedScans += 1
+                    if failedScans <= 2 then
+                        requested = true
+                        scanAt = tick() + 5
+                    else
+                        print("[MatchaVD] fast vault: automatic scan retries stopped; use Refresh fast vault cache")
+                    end
+                else
+                    failedScans = 0
+                end
             end
 
             if entries and not vault.NeedsRefresh then
                 local wanted = if vault.Enabled then Desired() else gameDefaults
-                if not SameValues(session.Written, wanted) or tick() >= nextApply then
-                    if Apply(entries, wanted) then session.Written = table.clone(wanted) end
+                if not SameValues(session.Written, wanted) or now >= nextApply then
+                    if Apply(entries, wanted) then
+                        session.Written = table.clone(wanted)
+                        applyFailures = 0
+                    else
+                        applyFailures += 1
+                        if applyFailures >= 3 then
+                            entries = nil
+                            session.Entries = nil
+                            session.Written = nil
+                            vault.Ready = false
+                            vault.NeedsRefresh = true
+                            requested = true
+                            scanAt = tick() + 1.5
+                            applyFailures = 0
+                        end
+                    end
                     nextApply = tick() + checkInterval
                 end
             end
-            Sleep(if entries and not vault.NeedsRefresh then checkInterval else .1)
+
+            Sleep(if entries and not vault.NeedsRefresh then checkInterval else 0.1)
         end
     end)
 end
