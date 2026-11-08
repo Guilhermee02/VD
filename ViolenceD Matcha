@@ -446,7 +446,20 @@ local function ReadEntries(tracker)
     for index, child in tracker.Folder:GetChildren() do
         if index % 16 == 0 then Yield() end
         local address = child.Address
-        local entry = tracker.Entries[address] or tracker.Read(child)
+        local entry = tracker.Entries[address]
+        if not entry then
+            entry = tracker.Read(child)
+        elseif tracker == trackers.Generators then
+            -- Refresh the generator's live part/model reference without
+            -- resetting its repair-progress state and polling timers.
+            local pose = PartPose(child:FindFirstChild("GeneratorBody"), generatorSize)
+            if pose then
+                entry.Pose = pose
+                entry.Model = child
+            else
+                complete = false
+            end
+        end
         if entry then
             found[address] = entry
         else
@@ -463,17 +476,20 @@ local function UpdateTracker(tracker, map, now)
             if tracker.Folder then
                 tracker.Entries = {}
                 ReadEntries(tracker)
-                tracker.NextCheck = tick() + 5
+                tracker.NextCheck = tick() + 2
             else
                 tracker.NextSearch = tick() + 2
             end
         end
     elseif now >= tracker.NextCheck then
-        tracker.NextCheck = now + (if tracker.Complete then 10 else 5)
+        -- Generator folders can receive/recreate children during a match.
+        -- Rescan them periodically even after an initially complete scan.
+        local interval = if tracker == trackers.Generators then 2 else (if tracker.Complete then 10 else 5)
+        tracker.NextCheck = now + interval
         local current = tracker.Parent:FindFirstChild(tracker.Name)
         if not current or current.Address ~= tracker.Address then
             ResetTracker(tracker)
-        elseif not tracker.Complete then
+        else
             ReadEntries(tracker)
         end
     end
