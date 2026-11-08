@@ -1,2402 +1,1527 @@
--- GUILHERME ZICA: stabilized generator ESP, bear-trap ESP, auto skill checks, and Fast Vault.
--- Auto Parry removed. Render, trap-root lookup, and skill-check offset probing are guarded.
--- Matcha is the only control panel; no separate in-game HUD is created.
+if game.GameId == 6739698191 then
 
-local previous = _G.__GUILHERME_ZICA or _G.__SWANGY
-if previous and previous.unload then pcall(previous.unload) end
+local generatorColor = Color3.fromRGB(157, 159, 255)
+local palletColor = Color3.fromRGB(255, 140, 0)
+local windowColor = Color3.fromRGB(204, 184, 184)
+local completedColor = Color3.fromRGB(80, 220, 100)
+local repairingColor = Color3.fromRGB(255, 220, 60)
+local regressingColor = Color3.fromRGB(255, 60, 60)
+local textSize = 14
+local bGeneratorESP = true
+local bPalletESP = true
+local bWindowESP = true
+local bAutoSkillCheck = true
+local bFastVault = false
+local fastVaultDistance = 0
+local fastVaultAngle = 180
+local fastVaultSpeed = 0
+local bTrapESP = true
+local bZombieESP = true
+local bAutoPallet = true
+local bAutoCrouch = true
+local bInfoHud = true
+local bKickedColor = true
+local bHighlightFill = false
+local bHighlightOutline = true
+local highlightDistance = 1000
+local fillOpacity = .35
+local trapColor = Color3.fromRGB(255, 70, 70)
+local zombieColor = Color3.fromRGB(120, 255, 120)
+local skillCheckAngle = 108
+local outlineThickness = 1.5
+local palletNearDistance = 150
+local progressPollInterval = .5
+local progressStateTime = 1.5
+local palletSize = Vector3.new(6.0, 7.4, 1.3)
+local generatorSize = Vector3.new(8.19, 5.24, 5.10)
+local generatorFolders = {"Gens", "Generators", "newGenerators", "new Generators", "Generator"}
+local palletFolders = {"Pallets", "pallets"}
+local windowScanInterval = 2
+local windowStableScans = 1
+local minimumWindows = 3
+local palletPollInterval = .125
+local loopInterval = 1 / 60
+local bDebugStats = false
 
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
 
-
--- game:GetService can return nil in this VM - MEASURED 2026-10-29: all
--- three services nil in the same second that the global `workspace` was
--- fine. Every service is fetched with retries, Workspace falls back to the
--- global, and a missing one waits for the game instead of dying (that was
--- the Matcha:13 "LocalPlayer" error that needed a rejoin).
-local function guilhermeZicaService(name)
-    for _ = 1, 6 do
-        local ok, s = pcall(function() return game:GetService(name) end)
-        if ok and s then return s end
-    end
-    local ok2, s2 = pcall(function() return game:FindFirstChild(name) end)
-    if ok2 and s2 then return s2 end
-    -- GetService also returns nil for RunService and Players in this VM, but
-    -- the services are still children of the DataModel: game:GetChildren()
-    -- lists Players and RunService. Match on ClassName because some names
-    -- read as empty strings.
-    local okK, kids = pcall(function() return game:GetChildren() end)
-    if okK and type(kids) == "table" then
-        for i = 1, #kids do
-            local cls, nm = nil, nil
-            pcall(function() cls = kids[i].ClassName end)
-            pcall(function() nm = kids[i].Name end)
-            if cls == name or nm == name then return kids[i] end
+local function FetchOffsets()
+    local urls = {"https://offsets.imtheo.lol/" .. tostring(getrbxversion()) .. "/offsets.json", "https://offsets.imtheo.lol/offsets.json"}
+    for _, url in urls do
+        local body = httpget(url)
+        if type(body) == "string" and string.sub(body, 1, 1) == "{" then
+            local decoded = HttpService:JSONDecode(body)
+            if type(decoded) == "table" and type(decoded.Offsets) == "table" then return decoded.Offsets end
         end
     end
-    return nil
+    print("[MatchaVD] couldn't load offsets, auto parry off")
+    return {}
 end
 
-local Players, RunService, Workspace = nil, nil, nil
-local lp, mouse = nil, nil
+local O = FetchOffsets()
+local visibleOffset = tonumber(O.GuiObject and O.GuiObject.Visible) or 0x575
+local childrenStartOffset = tonumber(O.Instance and O.Instance.ChildrenStart)
+local childrenEndOffset = tonumber(O.Instance and O.Instance.ChildrenEnd)
+local nameOffset = tonumber(O.Instance and O.Instance.Name)
+local primitiveOffset = tonumber(O.BasePart and O.BasePart.Primitive)
+local primitivePositionOffset = tonumber(O.Primitive and O.Primitive.Position)
+local memoryReady = childrenStartOffset and childrenEndOffset and nameOffset and primitiveOffset and primitivePositionOffset and true or false
 
--- every load takes a generation token, not just a load that waits: an older
--- waiter used to survive a reload, finish later and build a second hub
-local loadToken = {}
-_G.__GUILHERME_ZICA_LOAD = loadToken
-_G.__SWANGY_LOAD = loadToken -- legacy reload-token compatibility
+local Players = game:GetService("Players")
+local runId = tick()
+_G.MatchaVDRunId = runId
+if _G.MatchaVDConnection then _G.MatchaVDConnection:Disconnect() end
+for _, object in _G.MatchaVDDrawings or {} do
+    if type(object) == "table" then (object.Square or object.Object):Remove() else object:Remove() end
+end
+local allDrawings = {}
+_G.MatchaVDDrawings = allDrawings
 
-local function resolveCore()
-    Players = Players or guilhermeZicaService("Players")
-    RunService = RunService or guilhermeZicaService("RunService")
-    if not Workspace then
-        pcall(function() Workspace = workspace end)
-        if not Workspace then Workspace = guilhermeZicaService("Workspace") end
-    end
-    if not lp then
-        -- three routes: the cached service, a fresh one, and the datamodel
-        -- property. A stale Players wrapper was one of the ways this ended
-        -- in "index nil with LocalPlayer".
-        if Players then pcall(function() lp = Players.LocalPlayer end) end
-        if not lp then pcall(function() lp = game:GetService("Players").LocalPlayer end) end
-        if not lp then pcall(function() lp = game.Players.LocalPlayer end) end
-    end
-    return Players ~= nil and RunService ~= nil and Workspace ~= nil and lp ~= nil
+local frame = {}
+local stats = {Loops = 0, LoopTime = 0, Renders = 0, RenderTime = 0, Writes = 0, Lines = 0, Next = 0, Skill = 0, Scans = 0, ScanTime = 0, ScanMax = 0}
+local windows = {}
+
+local function Running()
+    return _G.MatchaVDRunId == runId
 end
 
--- Measured: right after the game attaches this VM reports every service as
--- nil (and Players.LocalPlayer as nil) for a second or two. Returning here
--- was the "Matcha:13 attempt to index nil with 'LocalPlayer'" / "rejoin to
--- fix" path. Wait for the game instead; a newer load cancels the wait.
-if not resolveCore() then
-    -- a loaded chunk cannot yield at its top level in this VM, so blocking
-    -- here dies silently and leaves you reloading by hand. Queue a retry
-    -- instead; it re-runs the file once the game is readable.
-    print("[GUILHERME ZICA] game not attached yet - queued, it will start by itself")
-    task.spawn(function()
-        while _G.__GUILHERME_ZICA_LOAD == loadToken do
-            if resolveCore() then
-                local src
-                if type(readfile) == "function" then
-                    local okr, s = pcall(readfile, "GUILHERME_ZICA.lua")
-                    if okr then src = s end
-                end
-                if type(src) == "string" and #src > 100 then
-                    local fn, cerr = loadstring(src, "GUILHERME_ZICA.lua")
-                    if fn then
-                        local ok, rerr = pcall(fn)
-                        if not ok then print("[GUILHERME ZICA] deferred load failed: " .. tostring(rerr)) end
-                    else
-                        print("[GUILHERME ZICA] deferred compile failed: " .. tostring(cerr))
-                    end
+local function Valid(pointer)
+    return pointer ~= nil and pointer > 0x10000 and pointer < 0x7FFFFFFFFFFF
+end
+
+local world = {NextRefresh = 0, NextKillerType = 0, KillerType = ""}
+
+-- Fast Vault (adapted from the supplied Swangy implementation).
+-- setgc performs a full GC sweep in this executor, so changes are debounced
+-- and writes are never repeated on a timer.
+local fastVaultFast = {DISTANCE = 0, REPEAT_DISTANCE = 0, DOT = -1, MIN_SPEED = -1}
+local fastVaultSlow = {DISTANCE = 3, REPEAT_DISTANCE = 3.5, DOT = 0.7071067811865476, MIN_SPEED = 12.5}
+local fastVaultState = {
+    applied = false,
+    dirty = false,
+    restore = false,
+    due = 0,
+    job = nil,
+    busy = false,
+    lastError = nil,
+}
+
+local function QueueFastVaultWrite(restore)
+    fastVaultState.dirty = true
+    fastVaultState.restore = restore == true
+    fastVaultState.due = os.clock() + 0.8
+end
+
+local function SetFastVaultEnabled(enabled)
+    enabled = enabled == true
+    if bFastVault == enabled then return end
+    bFastVault = enabled
+    QueueFastVaultWrite(not enabled)
+end
+
+local function SetFastVaultOption(key, value)
+    value = tonumber(value)
+    if not value then return end
+    if key == "distance" then
+        fastVaultDistance = math.clamp(value, 0, 4)
+    elseif key == "angle" then
+        fastVaultAngle = math.clamp(value, 0, 180)
+    elseif key == "speed" then
+        fastVaultSpeed = math.clamp(value, 0, 24)
+    else
+        return
+    end
+    -- Do not invoke setgc for every slider movement: it sweeps the full GC.
+    -- New thresholds are picked up the next time the feature is toggled on.
+end
+
+task.spawn(function()
+    while Running() do
+        if fastVaultState.dirty and os.clock() >= fastVaultState.due and not fastVaultState.busy then
+            fastVaultState.dirty = false
+            fastVaultState.busy = true
+
+            local ok, err
+            if fastVaultState.restore or not bFastVault then
+                if type(setgc) == "function" then
+                    ok, err = pcall(setgc, fastVaultSlow)
                 else
-                    print("[GUILHERME ZICA] deferred load: GUILHERME_ZICA.lua unreadable")
+                    ok, err = false, "setgc unavailable"
                 end
+                if ok then
+                    fastVaultState.applied = false
+                    fastVaultState.job = nil
+                    fastVaultState.lastError = nil
+                    print("[MatchaVD] Fast Vault restored")
+                end
+            else
+                if type(setgc) == "function" then
+                    fastVaultFast.DISTANCE = fastVaultDistance
+                    fastVaultFast.REPEAT_DISTANCE = fastVaultDistance
+                    fastVaultFast.DOT = math.cos(math.rad(fastVaultAngle))
+                    fastVaultFast.MIN_SPEED = fastVaultSpeed > 0 and fastVaultSpeed or -1
+                    ok, err = pcall(setgc, fastVaultFast)
+                else
+                    ok, err = false, "setgc unavailable"
+                end
+                if ok then
+                    fastVaultState.applied = true
+                    fastVaultState.job = tostring(game.JobId)
+                    fastVaultState.lastError = nil
+                    print("[MatchaVD] Fast Vault applied")
+                end
+            end
+
+            if not ok then
+                fastVaultState.lastError = tostring(err)
+                print("[MatchaVD] Fast Vault error: " .. tostring(err))
+            end
+            fastVaultState.busy = false
+        end
+
+        -- Re-apply only once after a server change; never poll setgc repeatedly.
+        if bFastVault and fastVaultState.applied
+            and fastVaultState.job ~= tostring(game.JobId)
+            and not fastVaultState.dirty then
+            QueueFastVaultWrite(false)
+        end
+
+        task.wait(0.2)
+    end
+end)
+
+
+local function ReadStdString(address)
+    local capacity = memory_read("uintptr_t", address + 0x18)
+    local text = if capacity and capacity >= 16 then memory_read("uintptr_t", address) else address
+    local raw = if Valid(text) then memory_read("string", text) else nil
+    return if type(raw) == "string" then raw else ""
+end
+
+local function MemoryChildren(address)
+    local list = memory_read("uintptr_t", address + childrenStartOffset)
+    if not Valid(list) then return nil end
+    local first = memory_read("uintptr_t", list)
+    local last = memory_read("uintptr_t", list + childrenEndOffset)
+    if not Valid(first) or not last or last < first or last - first > 0x10 * 10000 then return nil end
+    local result = {}
+    for entry = first, last - 0x10, 0x10 do
+        local child = memory_read("uintptr_t", entry)
+        if Valid(child) then result[#result + 1] = child end
+    end
+    return result
+end
+
+local function MemoryName(address)
+    local pointer = memory_read("uintptr_t", address + nameOffset)
+    return if Valid(pointer) then ReadStdString(pointer) else ""
+end
+
+local function MemoryChildNames(address)
+    local names = {}
+    for _, child in MemoryChildren(address) or {} do
+        names[MemoryName(child)] = child
+    end
+    return names
+end
+
+local function MemoryPosition(partAddress)
+    local primitive = memory_read("uintptr_t", partAddress + primitiveOffset)
+    if not Valid(primitive) then return nil end
+    local base = primitive + primitivePositionOffset
+    local x, y, z = memory_read("float", base), memory_read("float", base + 4), memory_read("float", base + 8)
+    if not x or not y or not z or x ~= x or y ~= y or z ~= z or math.abs(x) > 1e6 or math.abs(y) > 1e6 or math.abs(z) > 1e6 then return nil end
+    return Vector3.new(x, y, z)
+end
+
+local function Finish(pose)
+    local half = pose.Size / 2
+    local right, up, look = pose.Right * half.X, pose.Up * half.Y, pose.Look * half.Z
+    local corners = table.create(24)
+    for corner = 0, 7 do
+        local point = pose.Position
+            + right * (if corner % 2 == 0 then 1 else -1)
+            + up * (if math.floor(corner / 2) % 2 == 0 then 1 else -1)
+            + look * (if corner >= 4 then 1 else -1)
+        corners[corner * 3 + 1], corners[corner * 3 + 2], corners[corner * 3 + 3] = point.X, point.Y, point.Z
+    end
+    pose.Corners = corners
+    pose.CX, pose.CY, pose.CZ = pose.Position.X, pose.Position.Y, pose.Position.Z
+    return pose
+end
+
+local function PartPose(part, fixedSize)
+    if not part then return nil end
+    local cframe = part.CFrame
+    local size = fixedSize or part.Size
+    if not cframe or not size or size.X <= 0 or size.Y <= 0 or size.Z <= 0 then return nil end
+    return Finish({Position = cframe.Position, Size = size, Right = cframe.RightVector, Up = cframe.UpVector, Look = cframe.LookVector})
+end
+
+local function ReadGenerator(generator)
+    local pose = PartPose(generator:FindFirstChild("GeneratorBody"), generatorSize)
+    return pose and {Pose = pose, Model = generator, Text = "", NextPoll = 0, RisingUntil = 0, FallingUntil = 0}
+end
+
+local function ReadPallet(pallet)
+    local intact = pallet:FindFirstChild("Intact")
+    local broken = pallet:FindFirstChild("Broken")
+    local part = intact and intact:FindFirstChild("Pallet")
+    local brokenPart = broken and broken:FindFirstChild("Pallet_Broken")
+    local pose = part and brokenPart and PartPose(part, palletSize)
+    if not pose then return nil end
+    return {Part = part, BrokenPart = brokenPart, IntactPose = pose, Pose = pose, Hitbox = PartPose(pallet:FindFirstChild("hitbox")), Dropped = false, Pending = 0, NextPoll = 0}
+end
+
+local trackers = {
+    Generators = {Names = generatorFolders, Child = "Generator", Read = ReadGenerator, Entries = {}},
+    Pallets = {Names = palletFolders, Child = "Newpallet", Read = ReadPallet, Entries = {}},
+}
+
+local function ResetTracker(tracker)
+    tracker.Folder, tracker.Parent, tracker.Name, tracker.Address = nil, nil, nil, nil
+    tracker.Entries, tracker.Complete, tracker.NextSearch = {}, false, 0
+end
+
+local function FindFolder(map, tracker)
+    local resources = map:FindFirstChild("resources")
+    for _, parent in {map, resources} do
+        for _, name in tracker.Names do
+            task.wait()
+            if not Running() then return end
+            local found = parent:FindFirstChild(name)
+            if found and found:FindFirstChild(tracker.Child) then
+                tracker.Folder, tracker.Parent, tracker.Name, tracker.Address = found, parent, name, found.Address
                 return
             end
-            task.wait(0.5)
-        end
-    end)
-    return
-end
-pcall(function() mouse = lp:GetMouse() end)
-
--- Kept features: Generator ESP, Bear Trap ESP, and automatic skill checks.
-local CFG = {
-    -- Drawing is capped at 30 Hz instead of running expensive projections
-    -- on every render frame. Filled polygons are opt-in to reduce CPU spikes.
-    drawHz = 24,
-    pollHz = 1.0,
-
-    gen = true,
-    genRange = 1000,
-    genPool = 12,
-    genText = 13,
-    genState = true,
-    genFill = false,
-    genFillA = 0.25,
-    genThick = 1.6,
-    genIdleColour = Color3.fromRGB(255, 150, 40),
-    genDoneColour = Color3.fromRGB(51, 255, 77),
-    genBrokenColour = Color3.fromRGB(255, 120, 120),
-
-    trap = true,
-    trapRange = 1000,
-    trapPool = 8,
-    trapText = 12,
-    trapFill = false,
-    trapFillA = 0.20,
-    trapThick = 1.6,
-    trapArmedColour = Color3.fromRGB(80, 255, 120),
-    trapSprungColour = Color3.fromRGB(255, 60, 60),
-
-    names = true,
-    namesOnly = false,
-
-    sc = true,
-    scLead = 2,
-    scKey = 32,
-    scHum = false,
-    scHumMin = 10,
-    scHumMax = 50,
-    scReact = 0,
-    scDelay = 0,
-    scHz = 120,
-    scRescue = true,
-    scDry = false,
-    scMode = nil,
-
-}
-
--- Matcha provides the controls; no separate on-screen HUD is created.
-local UI = nil
-
-local COL = {
-    genIdle = Color3.fromRGB(26, 255, 51),
-    genDone = Color3.fromRGB(51, 255, 77),
-    genPause = Color3.fromRGB(255, 210, 110),
-    genBad = Color3.fromRGB(255, 120, 120),
-}
-
-local FONT = Drawing.Fonts.SystemBold or Drawing.Fonts.System
-local EDGES = {
-    {1,2},{2,4},{4,3},{3,1},
-    {5,6},{6,8},{8,7},{7,5},
-    {1,5},{2,6},{3,7},{4,8},
-}
-local CORNER = {
-    {-1,-1,-1},{1,-1,-1},{-1,1,-1},{1,1,-1},
-    {-1,-1,1},{1,-1,1},{-1,1,1},{1,1,1},
-}
-
--- esp
-local function newSlot(thick, textSize)
-    local lines = {}
-    local top, sub
-
-    local ok, slot = pcall(function()
-        for i = 1, 12 do
-            local ln = Drawing.new("Line")
-            ln.Thickness = thick
-            ln.Visible = false
-            lines[i] = ln
-        end
-
-        top = Drawing.new("Text")
-        top.Size, top.Outline, top.Center, top.Visible = textSize, true, true, false
-        pcall(function() top.Font = FONT end)
-
-        sub = Drawing.new("Text")
-        sub.Size, sub.Outline, sub.Center, sub.Visible = textSize - 2, true, true, false
-        pcall(function() sub.Font = FONT end)
-
-        return {
-            lines = lines, tris = nil, top = top, sub = sub,
-            px = {}, py = {}, lf = {}, lt = {}, lth = {}, lcol = {}, lvis = {},
-        }
-    end)
-
-    if ok and slot then return slot end
-
-    -- If the executor refuses a Drawing allocation, clean up the partial slot
-    -- instead of leaking half-created objects on every retry.
-    for i = 1, #lines do pcall(function() lines[i]:Remove() end) end
-    if top then pcall(function() top:Remove() end) end
-    if sub then pcall(function() sub:Remove() end) end
-    return nil
-end
-
-local function removeSlot(e)
-    if not e then return end
-    for _, ln in ipairs(e.lines) do pcall(function() ln:Remove() end) end
-    if e.tris then
-        for _, tr in ipairs(e.tris) do pcall(function() tr:Remove() end) end
-    end
-    pcall(function() e.top:Remove() end)
-    pcall(function() e.sub:Remove() end)
-end
-
-local function hideSlot(e)
-    if not e then return end
-    for i = 1, 12 do
-        e.lvis[i] = false
-        if e.lines[i].Visible then e.lines[i].Visible = false end
-    end
-    if e.tris then
-        for i = 1, 6 do
-            if e.tris[i].Visible then e.tris[i].Visible = false end
-        end
-    end
-    if e.top.Visible then e.top.Visible = false end
-    if e.sub.Visible then e.sub.Visible = false end
-end
-
-local function ensureTriangles(e)
-    if not e or e.tris then return true end
-
-    local tris = {}
-    for i = 1, 6 do
-        local ok, tr = pcall(Drawing.new, "Triangle")
-        if not ok or not tr then
-            for j = 1, #tris do pcall(function() tris[j]:Remove() end) end
-            return false
-        end
-
-        local propOk = pcall(function()
-            tr.Thickness = 0
-            tr.Filled = true
-            tr.Visible = false
-        end)
-        if not propOk then
-            pcall(function() tr:Remove() end)
-            for j = 1, #tris do pcall(function() tris[j]:Remove() end) end
-            return false
-        end
-        tris[i] = tr
-    end
-
-    e.tris = tris
-    return true
-end
-
-local function ensureSlots(pool, count, thick, text, needFill)
-    -- Called by background collectors, never by the render callback.
-    -- Create a maximum of four new slots/fill sets per pass to avoid spikes.
-    local work = 0
-    for i = 1, count do
-        local created = false
-        if not pool[i] then
-            local slot = newSlot(thick, text)
-            if not slot then break end
-            pool[i] = slot
-            created = true
-        end
-
-        local fillCreated = false
-        if needFill and not pool[i].tris then
-            fillCreated = ensureTriangles(pool[i])
-        end
-
-        if created or fillCreated then work = work + 1 end
-        if work >= 4 then break end
-    end
-end
-
--- names-only mode: keep the label, drop the box and its fill
-local function hideBox(e)
-    if not e then return end
-    for i = 1, 12 do
-        if e.lines[i].Visible then
-            e.lvis[i] = false
-            e.lines[i].Visible = false
-        end
-    end
-    if e.tris then
-        for i = 1, 6 do
-            if e.tris[i].Visible then e.tris[i].Visible = false end
         end
     end
 end
 
-local function convexHull(pts)
-    local sorted = {}
-    for _, p in ipairs(pts) do sorted[#sorted + 1] = p end
-    if #sorted < 3 then return nil end
-    table.sort(sorted, function(a, b)
-        return a.x < b.x or (a.x == b.x and a.y < b.y)
-    end)
-    local cross = function(o, a, b)
-        return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
-    end
-    local hull = {}
-    for _, p in ipairs(sorted) do
-        while #hull >= 2 and cross(hull[#hull - 1], hull[#hull], p) <= 0 do
-            table.remove(hull)
-        end
-        hull[#hull + 1] = p
-    end
-    local lower = #hull + 1
-    for i = #sorted - 1, 1, -1 do
-        local p = sorted[i]
-        while #hull >= lower and cross(hull[#hull - 1], hull[#hull], p) <= 0 do
-            table.remove(hull)
-        end
-        hull[#hull + 1] = p
-    end
-    table.remove(hull)
-    if #hull < 3 then return nil end
-    return hull
-end
-
-local R_AXIS, U_AXIS, B_AXIS = Vector3.new(1, 0, 0), Vector3.new(0, 1, 0), Vector3.new(0, 0, 1)
-
-local function basisFromCFrame(cf)
-    if cf then
-        local okr, r = pcall(function() return cf.RightVector end)
-        local oku, u = pcall(function() return cf.UpVector end)
-        local okl, l = pcall(function() return cf.LookVector end)
-        if okr and r and oku and u and okl and l then
-            return r, u, -l
-        end
-    end
-    return R_AXIS, U_AXIS, B_AXIS
-end
-
-local camNow, camVpW, camVpH = nil, 1920, 1080
-
-local function drawBox(e, center, hx, hy, hz, right, up, back, colour, fillAlpha, thick)
-    local px, py = e.px, e.py
-    local cx, cy, cz = center.X, center.Y, center.Z
-    local rX, rY, rZ = right.X, right.Y, right.Z
-    local uX, uY, uZ = up.X, up.Y, up.Z
-    local bX, bY, bZ = back.X, back.Y, back.Z
-    local anyFront, frontN = false, 0
-    local minX, maxX, minY, maxY = math.huge, -math.huge, math.huge, -math.huge
-    for i = 1, 8 do
-        local c = CORNER[i]
-        local ax, ay, az = c[1] * hx, c[2] * hy, c[3] * hz
-        local sp, onScreen = WorldToScreen(Vector3.new(
-            cx + rX * ax + uX * ay + bX * az,
-            cy + rY * ax + uY * ay + bY * az,
-            cz + rZ * ax + uZ * ay + bZ * az))
-        if onScreen and sp then
-            local sx, sy = sp.X, sp.Y
-            px[i], py[i] = sx, sy
-            anyFront, frontN = true, frontN + 1
-            if sx < minX then minX = sx end
-            if sx > maxX then maxX = sx end
-            if sy < minY then minY = sy end
-            if sy > maxY then maxY = sy end
+local function ReadEntries(tracker)
+    local complete = true
+    local found = {}
+    for index, child in tracker.Folder:GetChildren() do
+        if index % 16 == 0 then task.wait() end
+        local address = child.Address
+        local entry = tracker.Entries[address] or tracker.Read(child)
+        if entry then
+            found[address] = entry
         else
-            px[i] = nil
+            complete = false
         end
     end
-    if not anyFront then
-        hideSlot(e)
+    tracker.Entries, tracker.Complete = found, complete
+end
+
+local function UpdateTracker(tracker, map, now)
+    if not tracker.Folder then
+        if map and now >= tracker.NextSearch then
+            FindFolder(map, tracker)
+            if tracker.Folder then
+                tracker.Entries = {}
+                ReadEntries(tracker)
+                tracker.NextCheck = tick() + 5
+            else
+                tracker.NextSearch = tick() + 2
+            end
+        end
+    elseif now >= tracker.NextCheck then
+        tracker.NextCheck = now + (if tracker.Complete then 10 else 5)
+        local current = tracker.Parent:FindFirstChild(tracker.Name)
+        if not current or current.Address ~= tracker.Address then
+            ResetTracker(tracker)
+        elseif not tracker.Complete then
+            ReadEntries(tracker)
+        end
+    end
+end
+
+local function IsNear(pose)
+    local dx, dy, dz = pose.CX - frame.PX, pose.CY - frame.PY, pose.CZ - frame.PZ
+    return dx * dx + dy * dy + dz * dz < palletNearDistance * palletNearDistance
+end
+
+local function UpdateGenerators(now)
+    for _, entry in trackers.Generators.Entries do
+        if not entry.Completed and now >= entry.NextPoll then
+            entry.NextPoll = now + progressPollInterval
+            local progress = tonumber(entry.Model:GetAttribute("RepairProgress"))
+            if progress then
+                local last = entry.Progress
+                if last and progress > last + .01 then
+                    entry.RisingUntil = now + progressStateTime
+                elseif last and progress < last - .01 then
+                    entry.FallingUntil = now + progressStateTime
+                end
+                entry.Progress = progress
+                entry.Text = string.format("%d%%", math.floor(progress))
+                if progress >= 100 then
+                    entry.Completed, entry.Text, entry.State = true, "100%", "Done"
+                elseif now < entry.FallingUntil then
+                    entry.State = "Falling"
+                elseif now < entry.RisingUntil then
+                    entry.State = "Rising"
+                else
+                    entry.State = nil
+                end
+            end
+        end
+    end
+end
+
+local function GeneratorColor(entry)
+    local state = entry.State
+    if state == "Done" then return completedColor end
+    if state == "Falling" and bKickedColor then return regressingColor end
+    if state == "Rising" then return repairingColor end
+    return generatorColor
+end
+
+local function UpdatePallets(now)
+    if not frame.Ready then return end
+    for _, entry in trackers.Pallets.Entries do
+        if not entry.Hidden and now >= entry.NextPoll then
+            entry.NextPoll = now + (if IsNear(entry.IntactPose) then palletPollInterval else 1)
+            local transparency = entry.Part.Transparency
+            local canCollide = entry.Part.CanCollide
+            if transparency == nil or transparency > .99 then
+                entry.Hidden = true
+            elseif canCollide ~= nil then
+                local dropped = not canCollide
+                if dropped == entry.Dropped then
+                    entry.Pending = 0
+                else
+                    entry.Pending += 1
+                    if entry.Pending >= 2 then
+                        entry.Dropped, entry.Pending = dropped, 0
+                        if dropped then
+                            entry.BrokenPose = entry.BrokenPose or PartPose(entry.BrokenPart, palletSize)
+                            entry.Pose = entry.BrokenPose or entry.IntactPose
+                        else
+                            entry.Pose = entry.IntactPose
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function ScanWindows(map)
+    local started = os.clock()
+    local descendants = map:GetDescendants()
+    local blocked = os.clock() - started
+    stats.Scans += 1
+    if blocked > stats.ScanMax then stats.ScanMax = blocked end
+    local found = table.clone(windows)
+    for index, object in descendants do
+        if index % 500 == 0 then
+            task.wait()
+            if not Running() then return end
+        end
+        if object.Name == "Window" then
+            local address = object.Address
+            local pose = windows[address]
+            if not pose then
+                local bottom = object:FindFirstChild("Bottom")
+                pose = bottom and PartPose(bottom)
+            end
+            if pose then found[address] = pose end
+        end
+    end
+    windows = found
+    local count = 0
+    for _ in found do count += 1 end
+    return count
+end
+
+local function UpdateCamera(now)
+    local camera = workspace.CurrentCamera
+    if not camera then
+        frame.Ready = false
+        return
+    end
+    local cframe = camera.CFrame
+    local position, look, right, up = cframe.Position, cframe.LookVector, cframe.RightVector, cframe.UpVector
+    frame.PX, frame.PY, frame.PZ = position.X, position.Y, position.Z
+    frame.LX, frame.LY, frame.LZ = look.X, look.Y, look.Z
+    frame.RX, frame.RY, frame.RZ = right.X, right.Y, right.Z
+    frame.UX, frame.UY, frame.UZ = up.X, up.Y, up.Z
+    if not frame.NextLens or now >= frame.NextLens then
+        frame.NextLens = now + .25
+        local viewport = camera.ViewportSize
+        frame.HalfWidth, frame.HalfHeight = viewport.X / 2, viewport.Y / 2
+        frame.Focal = viewport.Y / 2 / math.tan(math.rad(camera.FieldOfView) / 2)
+    end
+    frame.Ready = true
+end
+
+local lines = {}
+local usedLines, wantedLines = 0, 0
+
+local function GrowLines()
+    for _ = 1, 20 do
+        if #lines >= wantedLines then return end
+        local object = Drawing.new("Line")
+        object.Thickness = outlineThickness
+        object.Transparency = 1
+        object.Visible = false
+        allDrawings[#allDrawings + 1] = object
+        lines[#lines + 1] = {Object = object, Visible = false}
+    end
+end
+
+local function DrawLine(x1, y1, x2, y2, color)
+    usedLines += 1
+    local entry = lines[usedLines]
+    if not entry then return end
+    x1, y1, x2, y2 = math.floor(x1 + .5), math.floor(y1 + .5), math.floor(x2 + .5), math.floor(y2 + .5)
+    if entry.X1 ~= x1 or entry.Y1 ~= y1 then
+        entry.X1, entry.Y1 = x1, y1
+        entry.Object.From = Vector2.new(x1, y1)
+        stats.Writes += 1
+    end
+    if entry.X2 ~= x2 or entry.Y2 ~= y2 then
+        entry.X2, entry.Y2 = x2, y2
+        entry.Object.To = Vector2.new(x2, y2)
+        stats.Writes += 1
+    end
+    if entry.Color ~= color then
+        entry.Color = color
+        entry.Object.Color = color
+    end
+    if not entry.Visible then
+        entry.Visible = true
+        entry.Object.Visible = true
+    end
+end
+
+local texts = {}
+local usedTexts, wantedTexts = 0, 0
+
+local function GrowTexts()
+    for _ = 1, 2 do
+        if #texts >= wantedTexts then return end
+        local object = Drawing.new("Text")
+        object.Size = textSize
+        object.Center = true
+        object.Outline = true
+        object.Visible = false
+        allDrawings[#allDrawings + 1] = object
+        texts[#texts + 1] = {Object = object, Visible = false}
+    end
+end
+
+local function DrawText(x, y, text, color)
+    usedTexts += 1
+    local entry = texts[usedTexts]
+    if not entry then return end
+    x, y = math.floor(x + .5), math.floor(y + .5)
+    if entry.X ~= x or entry.Y ~= y then
+        entry.X, entry.Y = x, y
+        entry.Object.Position = Vector2.new(x, y)
+        stats.Writes += 1
+    end
+    if entry.Text ~= text then
+        entry.Text = text
+        entry.Object.Text = text
+    end
+    if entry.Color ~= color then
+        entry.Color = color
+        entry.Object.Color = color
+    end
+    if not entry.Visible then
+        entry.Visible = true
+        entry.Object.Visible = true
+    end
+end
+
+local triangles = {}
+local usedTriangles, wantedTriangles = 0, 0
+
+local function GrowTriangles()
+    for _ = 1, 8 do
+        if #triangles >= wantedTriangles then return end
+        local object = Drawing.new("Triangle")
+        object.Filled = true
+        object.Transparency = fillOpacity
+        object.Visible = false
+        allDrawings[#allDrawings + 1] = object
+        triangles[#triangles + 1] = {Object = object, Visible = false}
+    end
+end
+
+local function DrawTriangle(x1, y1, x2, y2, x3, y3, color)
+    usedTriangles += 1
+    local entry = triangles[usedTriangles]
+    if not entry then return end
+    x1, y1, x2, y2, x3, y3 = math.floor(x1 + .5), math.floor(y1 + .5), math.floor(x2 + .5), math.floor(y2 + .5), math.floor(x3 + .5), math.floor(y3 + .5)
+    if entry.X1 ~= x1 or entry.Y1 ~= y1 then
+        entry.X1, entry.Y1 = x1, y1
+        entry.Object.PointA = Vector2.new(x1, y1)
+    end
+    if entry.X2 ~= x2 or entry.Y2 ~= y2 then
+        entry.X2, entry.Y2 = x2, y2
+        entry.Object.PointB = Vector2.new(x2, y2)
+    end
+    if entry.X3 ~= x3 or entry.Y3 ~= y3 then
+        entry.X3, entry.Y3 = x3, y3
+        entry.Object.PointC = Vector2.new(x3, y3)
+    end
+    if entry.Color ~= color then
+        entry.Color = color
+        entry.Object.Color = color
+    end
+    if not entry.Visible then
+        entry.Visible = true
+        entry.Object.Visible = true
+    end
+end
+
+local function DrawLabel(pose, text, color)
+    local x, y, z = pose.CX - frame.PX, pose.CY - frame.PY, pose.CZ - frame.PZ
+    local depth = x * frame.LX + y * frame.LY + z * frame.LZ
+    if depth < .1 then return end
+    local scale = frame.Focal / depth
+    local sx = frame.HalfWidth + (x * frame.RX + y * frame.RY + z * frame.RZ) * scale
+    local sy = frame.HalfHeight - (x * frame.UX + y * frame.UY + z * frame.UZ) * scale
+    if sx < 0 or sy < 0 or sx > frame.HalfWidth * 2 or sy > frame.HalfHeight * 2 then return end
+    DrawText(sx, sy, text, color)
+end
+
+local screenX, screenY = table.create(8), table.create(8)
+local order, hull = table.create(8), table.create(16)
+
+local function Cross(o, a, b)
+    return (screenX[a] - screenX[o]) * (screenY[b] - screenY[o]) - (screenY[a] - screenY[o]) * (screenX[b] - screenX[o])
+end
+
+local function Before(a, b)
+    return screenX[a] < screenX[b] or (screenX[a] == screenX[b] and screenY[a] < screenY[b])
+end
+
+local function Highlight(pose, color, anyDistance)
+    if not bHighlightFill and not bHighlightOutline then return end
+    local px, py, pz = frame.PX, frame.PY, frame.PZ
+    if not anyDistance then
+        local dx, dy, dz = pose.CX - px, pose.CY - py, pose.CZ - pz
+        if dx * dx + dy * dy + dz * dz > highlightDistance * highlightDistance then return end
+    end
+    local corners = pose.Corners
+    local lx, ly, lz = frame.LX, frame.LY, frame.LZ
+    local rx, ry, rz = frame.RX, frame.RY, frame.RZ
+    local ux, uy, uz = frame.UX, frame.UY, frame.UZ
+    local halfWidth, halfHeight, focal = frame.HalfWidth, frame.HalfHeight, frame.Focal
+    local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+    for i = 1, 8 do
+        local base = i * 3 - 2
+        local x, y, z = corners[base] - px, corners[base + 1] - py, corners[base + 2] - pz
+        local depth = x * lx + y * ly + z * lz
+        if depth < .1 then return end
+        local scale = focal / depth
+        local sx = halfWidth + (x * rx + y * ry + z * rz) * scale
+        local sy = halfHeight - (x * ux + y * uy + z * uz) * scale
+        screenX[i], screenY[i] = sx, sy
+        if sx < minX then minX = sx end
+        if sx > maxX then maxX = sx end
+        if sy < minY then minY = sy end
+        if sy > maxY then maxY = sy end
+        order[i] = i
+    end
+    if maxX < 0 or maxY < 0 or minX > halfWidth * 2 or minY > halfHeight * 2 then return end
+
+    for i = 2, 8 do
+        local value = order[i]
+        local j = i - 1
+        while j >= 1 and Before(value, order[j]) do
+            order[j + 1] = order[j]
+            j -= 1
+        end
+        order[j + 1] = value
+    end
+    local count = 0
+    for i = 1, 8 do
+        local point = order[i]
+        while count >= 2 and Cross(hull[count - 1], hull[count], point) <= 0 do count -= 1 end
+        count += 1
+        hull[count] = point
+    end
+    local lower = count + 1
+    for i = 7, 1, -1 do
+        local point = order[i]
+        while count >= lower and Cross(hull[count - 1], hull[count], point) <= 0 do count -= 1 end
+        count += 1
+        hull[count] = point
+    end
+    count -= 1
+    if count < 3 then return end
+    if bHighlightFill then
+        local first = hull[1]
+        for i = 2, count - 1 do
+            local b, c = hull[i], hull[i + 1]
+            DrawTriangle(screenX[first], screenY[first], screenX[b], screenY[b], screenX[c], screenY[c], color)
+        end
+    end
+    if bHighlightOutline then
+        for i = 1, count do
+            local a, b = hull[i], hull[i % count + 1]
+            DrawLine(screenX[a], screenY[a], screenX[b], screenY[b], color)
+        end
+    end
+end
+
+local function Project(x, y, z, minDepth)
+    x, y, z = x - frame.PX, y - frame.PY, z - frame.PZ
+    local depth = x * frame.LX + y * frame.LY + z * frame.LZ
+    if depth < (minDepth or .1) then return nil end
+    local scale = frame.Focal / depth
+    return frame.HalfWidth + (x * frame.RX + y * frame.RY + z * frame.RZ) * scale, frame.HalfHeight - (x * frame.UX + y * frame.UY + z * frame.UZ) * scale
+end
+
+local function TeamName(player)
+    local team = player.Team
+    return team and team.Name
+end
+
+local function RefreshWorld(now)
+    local player = Players.LocalPlayer
+    world.LocalTeam = TeamName(player)
+    local character = player.Character
+    world.LocalRoot = character and character:FindFirstChild("HumanoidRootPart")
+    local killerCharacter
+    for _, other in Players:GetPlayers() do
+        if TeamName(other) == "Killer" then
+            killerCharacter = other.Character
+            break
+        end
+    end
+    if killerCharacter ~= world.KillerCharacter then world.NextKillerType = 0 end
+    world.KillerCharacter = killerCharacter
+    world.KillerRoot = killerCharacter and killerCharacter:FindFirstChild("HumanoidRootPart")
+    if not killerCharacter then
+        world.KillerType = ""
+    elseif now >= world.NextKillerType then
+        world.NextKillerType = now + 2
+        world.KillerType = tostring(killerCharacter:GetAttribute("MorphedKiller") or "")
+    end
+end
+
+local RenderMapEntities, UpdateZombiePositions
+
+do
+    local traps, zombies = {}, {}
+    local readsPerTick = 300
+    local classifyWindow = 3
+
+    UpdateZombiePositions = function()
+        for _, zombie in zombies do
+            zombie.Position = MemoryPosition(zombie.Root)
+        end
+    end
+
+    task.spawn(function()
+        local known, firstSeen = {}, {}
+        local mapAddress
+        local reads = 0
+        local function Budget(count)
+            reads += count
+            if reads >= readsPerTick then
+                reads = 0
+                task.wait()
+            end
+        end
+        while Running() do
+            local wantTraps = bTrapESP and world.KillerType == "Butcher"
+            local wantZombies = bZombieESP and world.KillerType == "Cure"
+            if not wantTraps then traps = {} end
+            if not wantZombies then zombies = {} end
+            if not memoryReady or not (wantTraps or wantZombies) or not isrbxactive() or not world.MapAddress then
+                wait(.5)
+            else
+                if world.MapAddress ~= mapAddress then
+                    mapAddress, known, firstSeen, traps, zombies = world.MapAddress, {}, {}, {}, {}
+                end
+                local now = tick()
+                local children = MemoryChildren(mapAddress) or {}
+                Budget(#children)
+                local seen = {}
+                for _, child in children do
+                    if not Running() or world.MapAddress ~= mapAddress then break end
+                    seen[child] = true
+                    if known[child] == nil then
+                        local name = MemoryName(child)
+                        Budget(4)
+                        if name == "BearTrap" then
+                            local cube = MemoryChildNames(child).Cube
+                            local position = cube and MemoryPosition(cube)
+                            Budget(20)
+                            if position then
+                                traps[child] = {Position = position}
+                                known[child] = "Trap"
+                            end
+                        elseif wantZombies then
+                            firstSeen[child] = firstSeen[child] or now
+                            local names = MemoryChildNames(child)
+                            Budget(10)
+                            if names.Humanoid and names.HumanoidRootPart and names.RagdollConstraints then
+                                zombies[child] = {Root = names.HumanoidRootPart}
+                                known[child] = "Zombie"
+                            elseif now - firstSeen[child] > classifyWindow then
+                                known[child] = false
+                            end
+                        else
+                            known[child] = false
+                        end
+                    end
+                end
+                for child in known do
+                    if not seen[child] then
+                        known[child], firstSeen[child], traps[child], zombies[child] = nil, nil, nil, nil
+                    end
+                end
+                wait(1)
+            end
+        end
+    end)
+
+    RenderMapEntities = function()
+        for _, trap in traps do
+            local position = trap.Position
+            local x, y = Project(position.X, position.Y, position.Z)
+            if x then DrawText(x, y, "Bear Trap", trapColor) end
+        end
+        for _, zombie in zombies do
+            local position = zombie.Position
+            if position then
+                local x, top = Project(position.X, position.Y + 3, position.Z)
+                local _, bottom = Project(position.X, position.Y - 3, position.Z)
+                if x and bottom then
+                    local halfWidth = (bottom - top) * .3
+                    DrawLine(x - halfWidth, top, x + halfWidth, top, zombieColor)
+                    DrawLine(x + halfWidth, top, x + halfWidth, bottom, zombieColor)
+                    DrawLine(x + halfWidth, bottom, x - halfWidth, bottom, zombieColor)
+                    DrawLine(x - halfWidth, bottom, x - halfWidth, top, zombieColor)
+                    DrawText(x, top - 8, "Zombie", zombieColor)
+                end
+            end
+        end
+    end
+end
+
+local UpdateAutoCrouch, ReleaseCrouch
+
+do
+    local crouchKey = 0xA2
+    local waveSpeed = 70
+    local waveLead = .35
+    local waveHalfWidth = 6
+    local waveHalfDepth = 3.1
+    local waveMargin = 1.5
+    local waveHeight = 6
+    local releaseDelay = .15
+    local waves, names = {}, {}
+    local crouching = false
+    local lastThreat = -math.huge
+
+    ReleaseCrouch = function()
+        if crouching then keyrelease(crouchKey) end
+        crouching = false
+    end
+
+    UpdateAutoCrouch = function(now)
+        local root = world.LocalRoot
+        if not memoryReady or world.KillerType ~= "Abysswalker" or world.LocalTeam ~= "Survivors" or not root then
+            ReleaseCrouch()
+            return
+        end
+        local children = MemoryChildren(workspace.Address)
+        if children then
+            local seen = {}
+            for _, address in children do
+                seen[address] = true
+                if names[address] == nil then
+                    names[address] = MemoryName(address)
+                    if names[address] == "Wave" then
+                        local part = MemoryChildNames(address).Part
+                        if part then waves[address] = {Part = part} end
+                    end
+                end
+            end
+            for address in names do
+                if not seen[address] then names[address], waves[address] = nil, nil end
+            end
+        end
+
+        local me = root.Position
+        for _, wave in waves do
+            local position = MemoryPosition(wave.Part)
+            if position then
+                wave.First = wave.First or position
+                if not wave.Direction then
+                    local moved = Vector3.new(position.X - wave.First.X, 0, position.Z - wave.First.Z)
+                    if moved.Magnitude > 1 then wave.Direction = moved.Unit end
+                end
+                local direction = wave.Direction
+                if direction and math.abs(me.Y - position.Y) <= waveHeight then
+                    local offset = Vector3.new(me.X - position.X, 0, me.Z - position.Z)
+                    local along = offset:Dot(direction)
+                    local lateral = math.abs(offset:Dot(Vector3.new(-direction.Z, 0, direction.X)))
+                    if lateral <= waveHalfWidth + waveMargin and along >= -(waveHalfDepth + waveMargin) and along <= waveSpeed * waveLead + waveHalfDepth then
+                        lastThreat = now
+                    end
+                end
+            end
+        end
+
+        local shouldCrouch = now - lastThreat < releaseDelay
+        if shouldCrouch and not crouching then
+            keypress(crouchKey)
+            crouching = true
+        elseif not shouldCrouch and crouching then
+            ReleaseCrouch()
+        end
+    end
+end
+
+local UpdateAutoPallet
+
+do
+    local palletReach = 10
+    local hitboxMargin = .5
+    local pressInterval = .05
+    local nextPress = 0
+
+    local function InsideHitbox(box, point)
+        local offset = point - box.Position
+        local size = box.Size
+        return math.abs(offset:Dot(box.Right)) <= size.X / 2 + hitboxMargin
+            and math.abs(offset:Dot(box.Up)) <= size.Y / 2 + hitboxMargin
+            and math.abs(offset:Dot(box.Look)) <= size.Z / 2 + hitboxMargin
+    end
+
+    local function PressSpaceOnce()
+        keypress(0x20)
+        wait(.02)
+        keyrelease(0x20)
+    end
+
+    UpdateAutoPallet = function(now)
+        if world.LocalTeam ~= "Survivors" or not world.KillerRoot or not world.LocalRoot or now < nextPress then return end
+        local killerPosition, localPosition = world.KillerRoot.Position, world.LocalRoot.Position
+        if not killerPosition or not localPosition then return end
+        for _, entry in trackers.Pallets.Entries do
+            local box = entry.Hitbox
+            if box and not entry.Hidden and not entry.Dropped
+                and (box.Position - localPosition).Magnitude <= palletReach and InsideHitbox(box, killerPosition) then
+                nextPress = now + pressInterval
+                task.spawn(PressSpaceOnce)
+                return
+            end
+        end
+    end
+end
+
+local UpdateInfoHud, RenderInfoHud
+
+do
+    local style = {
+        File = "vd_hud.txt",
+        TitleHeight = 18,
+        LineHeight = 16,
+        TextSize = 14,
+        CharWidth = 7,
+        Padding = 6,
+        GripSize = 10,
+        MinWidth = 140,
+        MaxLines = 24,
+        Background = Color3.fromRGB(20, 20, 24),
+        Bar = Color3.fromRGB(45, 45, 55),
+        TextColor = Color3.fromRGB(235, 235, 235),
+        Heading = Color3.fromRGB(160, 170, 190),
+        Idle = Color3.fromRGB(255, 255, 255),
+        Working = Color3.fromRGB(255, 220, 60),
+        Failing = Color3.fromRGB(255, 60, 60),
+        Done = Color3.fromRGB(90, 220, 90),
+    }
+    style.KillerAttributes = {
+        Veil = {
+            {Attribute = "spearmode", Name = "Spear equipped", Kind = "Bool", TrueColor = style.Failing},
+            {Attribute = "Spears", Name = "Spears", Kind = "Number"},
+            {Attribute = "special", Name = "Special spear ready", Kind = "Bool", TrueColor = style.Working},
+        },
+        Slasher = {
+            {Attribute = "LakeMist", Name = "Invisible", Kind = "Bool", TrueColor = style.Failing},
+            {Attribute = "Pursuit", Name = "Pursuiting", Kind = "Bool", TrueColor = style.Failing},
+        },
+        Butcher = {
+            {Attribute = "beartraps", Name = "Bear traps available", Kind = "Number"},
+        },
+        Killer = {
+            {Attribute = "Frenzy", Name = "Killer frenzy", Kind = "Bool", TrueColor = style.Failing},
+        },
+        Masked = {
+            {Attribute = "Mask", Name = "Mask type", Kind = "Text", OtherColor = style.Working, Values = {
+                Tony = {Text = "Lethal punches", Color = style.Working},
+                Richard = {Text = "Basic"},
+                Cobra = {Text = "Extended lunge", Color = style.Working},
+                Rabbit = {Text = "Faster vaults", Color = style.Working},
+                Brandon = {Text = "Walk faster", Color = style.Working},
+                Richter = {Text = "Complete stealth", Color = style.Working},
+                Alex = {Text = "Chainsaw time", Color = style.Working},
+            }},
+        },
+    }
+    style.CommonAttributes = {
+        {Attribute = "Immobile", Name = "Stunned", Kind = "Bool", TrueColor = style.Working},
+        {Attribute = "IsCarrying", Name = "Carrying survivor", Kind = "Bool", TrueColor = style.Working},
+        {Attribute = "IsChasing", Name = "Chasing survivor", Kind = "Bool", TrueColor = style.Working},
+        {Attribute = "speedboost", Name = "Speed multiplier", Kind = "Number", Prefix = "x", Decimals = 2, NormalValue = 1, ChangedColor = style.Working},
+    }
+
+    local hud = {X = 40, Y = 200, Width = 230, Lines = {}, NextGenerators = 0, NextKiller = 0, WasDown = false}
+    if isfile(style.File) then
+        local x, y, w = string.match(readfile(style.File), "(%-?%d+) (%-?%d+) (%d+)")
+        if x then hud.X, hud.Y, hud.Width = tonumber(x), tonumber(y), math.max(tonumber(w), style.MinWidth) end
+    end
+
+    local function Create(kind, properties)
+        local object = Drawing.new(kind)
+        for key, value in properties do object[key] = value end
+        object.Visible = false
+        allDrawings[#allDrawings + 1] = object
+        return {Object = object, Visible = false}
+    end
+
+    local background = Create("Square", {Filled = true, Color = style.Background, Transparency = .85, ZIndex = 10})
+    local bar = Create("Square", {Filled = true, Color = style.Bar, Transparency = 1, ZIndex = 11})
+    local grip = Create("Square", {Filled = true, Color = style.Bar, Transparency = 1, ZIndex = 11})
+    local title = Create("Text", {Size = style.TextSize, Outline = true, Center = false, Color = style.TextColor, Text = "Info", ZIndex = 12})
+    local rows = {}
+    for i = 1, style.MaxLines do
+        rows[i] = Create("Text", {Size = style.TextSize, Outline = true, Center = false, ZIndex = 12})
+    end
+    local parts = {background, bar, grip, title}
+
+    local function Show(entry, visible)
+        if entry.Visible ~= visible then
+            entry.Visible = visible
+            entry.Object.Visible = visible
+        end
+    end
+
+    local function Place(entry, key, x, y)
+        x, y = math.floor(x + .5), math.floor(y + .5)
+        if entry[key .. "X"] ~= x or entry[key .. "Y"] ~= y then
+            entry[key .. "X"], entry[key .. "Y"] = x, y
+            entry.Object[key] = Vector2.new(x, y)
+        end
+    end
+
+    local function Set(entry, key, value)
+        if entry[key] ~= value then
+            entry[key] = value
+            entry.Object[key] = value
+        end
+    end
+
+    local function FormatValue(shown, value)
+        if shown.Kind == "Bool" then
+            local state = value == true or value == "true"
+            return if state then "true" else "false", if state and shown.TrueColor then shown.TrueColor else style.TextColor
+        end
+        if value == nil then return "?", style.TextColor end
+        if shown.Kind == "Text" then
+            local text = tostring(value)
+            local mapped = shown.Values and shown.Values[text]
+            if mapped then return mapped.Text, mapped.Color or style.TextColor end
+            return text, shown.OtherColor or style.TextColor
+        end
+        local number = tonumber(value)
+        if not number then return tostring(value), style.TextColor end
+        local color = if shown.NormalValue and number > shown.NormalValue + 1e-6 then shown.ChangedColor else style.TextColor
+        local text
+        if shown.Decimals then
+            local scale = 10 ^ shown.Decimals
+            text = string.format("%." .. shown.Decimals .. "f", math.floor(number * scale + 1e-9) / scale)
+        elseif number == math.floor(number) then
+            text = string.format("%d", number)
+        else
+            text = string.format("%.4g", number)
+        end
+        return (shown.Prefix or "") .. text, color
+    end
+
+    local function RefreshLines()
+        local lines = {{Text = "Generators", Color = style.Heading}}
+        local addresses = {}
+        for address in trackers.Generators.Entries do addresses[#addresses + 1] = address end
+        table.sort(addresses)
+        for _, address in addresses do
+            local entry = trackers.Generators.Entries[address]
+            local state = entry.State
+            local color = if state == "Done" then style.Done elseif state == "Falling" then style.Failing elseif state == "Rising" then style.Working else style.Idle
+            lines[#lines + 1] = {Text = "Generator: " .. (if entry.Text ~= "" then entry.Text else "?"), Color = color}
+        end
+        if #addresses == 0 then lines[#lines + 1] = {Text = "none found", Color = style.TextColor} end
+        lines[#lines + 1] = {Gap = true}
+        local killer = world.KillerCharacter
+        lines[#lines + 1] = {Text = if world.KillerType ~= "" then "Killer: " .. world.KillerType else "Killer", Color = style.Heading}
+        if not killer then
+            lines[#lines + 1] = {Text = "no killer found", Color = style.TextColor}
+        else
+            local shownList = {}
+            for _, shown in style.KillerAttributes[world.KillerType] or {} do shownList[#shownList + 1] = shown end
+            for _, shown in style.CommonAttributes do shownList[#shownList + 1] = shown end
+            for _, shown in shownList do
+                local text, color = FormatValue(shown, killer:GetAttribute(shown.Attribute))
+                lines[#lines + 1] = {Text = shown.Name .. ": " .. text, Color = color}
+            end
+        end
+        hud.Lines = lines
+    end
+
+    local function HandleMouse()
+        local mouse = hud.Mouse
+        if not mouse then
+            mouse = Players.LocalPlayer:GetMouse()
+            hud.Mouse = mouse
+        end
+        local down = ismouse1pressed() == true
+        local x, y = mouse.X, mouse.Y
+        if down and not hud.WasDown then
+            local height = hud.Height or 0
+            if x >= hud.X + hud.Width - style.GripSize and x <= hud.X + hud.Width and y >= hud.Y + height - style.GripSize and y <= hud.Y + height then
+                hud.Drag, hud.OffsetX = "Resize", hud.X + hud.Width - x
+            elseif x >= hud.X and x <= hud.X + hud.Width and y >= hud.Y and y <= hud.Y + style.TitleHeight then
+                hud.Drag, hud.OffsetX, hud.OffsetY = "Move", hud.X - x, hud.Y - y
+            end
+        elseif not down and hud.Drag then
+            hud.Drag = nil
+            writefile(style.File, string.format("%d %d %d", math.floor(hud.X), math.floor(hud.Y), math.floor(hud.Width)))
+        end
+        hud.WasDown = down
+        if hud.Drag == "Move" then
+            hud.X, hud.Y = x + hud.OffsetX, y + hud.OffsetY
+        elseif hud.Drag == "Resize" then
+            hud.Width = math.max(x + hud.OffsetX - hud.X, style.MinWidth)
+        end
+    end
+
+    UpdateInfoHud = function(now)
+        HandleMouse()
+        if now >= hud.NextKiller then
+            hud.NextKiller = now + .5
+            RefreshLines()
+        end
+    end
+
+    RenderInfoHud = function(visible)
+        if not visible then
+            for _, entry in parts do Show(entry, false) end
+            for _, row in rows do Show(row, false) end
+            return
+        end
+        local lineCount, gaps = 0, 0
+        for _, line in hud.Lines do
+            if line.Gap then gaps += 1 else lineCount += 1 end
+        end
+        lineCount = math.min(lineCount, style.MaxLines)
+        local height = style.TitleHeight + 4 + lineCount * style.LineHeight + gaps * 4 + style.Padding
+        hud.Height = height
+        Place(background, "Position", hud.X, hud.Y)
+        Place(background, "Size", hud.Width, height)
+        Place(bar, "Position", hud.X, hud.Y)
+        Place(bar, "Size", hud.Width, style.TitleHeight)
+        Place(grip, "Position", hud.X + hud.Width - style.GripSize, hud.Y + height - style.GripSize)
+        Place(grip, "Size", style.GripSize, style.GripSize)
+        Place(title, "Position", hud.X + style.Padding, hud.Y + 2)
+        for _, entry in parts do Show(entry, true) end
+
+        local maxChars = math.max(math.floor((hud.Width - style.Padding * 2) / style.CharWidth), 4)
+        local y = hud.Y + style.TitleHeight + 4
+        local used = 0
+        for _, line in hud.Lines do
+            if line.Gap then
+                y += 4
+            elseif used < style.MaxLines then
+                used += 1
+                local row = rows[used]
+                local text = line.Text
+                if #text > maxChars then text = string.sub(text, 1, maxChars - 2) .. ".." end
+                Place(row, "Position", hud.X + style.Padding, y)
+                Set(row, "Text", text)
+                Set(row, "Color", line.Color)
+                Show(row, true)
+                y += style.LineHeight
+            end
+        end
+        for i = used + 1, style.MaxLines do Show(rows[i], false) end
+    end
+end
+
+local function PrintStats(now)
+    if now < stats.Next then return end
+    local elapsed = now - stats.Next + 5
+    if stats.Next > 0 then
+        print(string.format("[MatchaVD] loop %d/s (%.1f ms/s) | render %d/s (%.2f ms avg, %d lines, %d writes/s) | skill %d/s | %d window scans (%.0f ms max, first call blocks)",
+            stats.Loops / elapsed, stats.LoopTime * 1000 / elapsed, stats.Renders / elapsed,
+            if stats.Renders > 0 then stats.RenderTime * 1000 / stats.Renders else 0, stats.Lines, stats.Writes / elapsed,
+            stats.Skill / elapsed, stats.Scans, stats.ScanMax * 1000))
+    end
+    stats.Loops, stats.LoopTime, stats.Renders, stats.RenderTime, stats.Writes = 0, 0, 0, 0, 0
+    stats.Skill, stats.Scans, stats.ScanMax = 0, 0, 0
+    stats.Next = now + 5
+end
+
+local function Render()
+    local started = os.clock()
+    usedLines, usedTexts, usedTriangles = 0, 0, 0
+    UpdateCamera(tick())
+    if frame.Ready then
+        if bPalletESP then
+            for _, entry in trackers.Pallets.Entries do
+                if not entry.Hidden then Highlight(entry.Pose, palletColor) end
+            end
+        end
+        if bWindowESP then
+            for _, pose in windows do Highlight(pose, windowColor) end
+        end
+        if bGeneratorESP then
+            for _, entry in trackers.Generators.Entries do
+                local color = GeneratorColor(entry)
+                Highlight(entry.Pose, color, true)
+                if entry.Text ~= "" then DrawLabel(entry.Pose, entry.Text, color) end
+            end
+        end
+        RenderMapEntities()
+    end
+    RenderInfoHud(bInfoHud)
+    if usedLines > wantedLines then wantedLines = usedLines end
+    if usedTexts > wantedTexts then wantedTexts = usedTexts end
+    if usedTriangles > wantedTriangles then wantedTriangles = usedTriangles end
+    for index = usedTriangles + 1, #triangles do
+        local entry = triangles[index]
+        if entry.Visible then
+            entry.Visible = false
+            entry.Object.Visible = false
+        end
+    end
+    for index = usedLines + 1, #lines do
+        local entry = lines[index]
+        if entry.Visible then
+            entry.Visible = false
+            entry.Object.Visible = false
+        end
+    end
+    for index = usedTexts + 1, #texts do
+        local entry = texts[index]
+        if entry.Visible then
+            entry.Visible = false
+            entry.Object.Visible = false
+        end
+    end
+    if bDebugStats then
+        stats.Renders += 1
+        stats.Lines = usedLines
+        stats.RenderTime += os.clock() - started
+    end
+end
+
+task.spawn(function()
+    local map, mapAddress, generatorFolder
+    local nextMapCheck, nextWindowScan = 0, 0
+    local windowCount, stableScans = -1, 0
+    local function RestartWindows(now)
+        windows, nextWindowScan, windowCount, stableScans = {}, now + 2, -1, 0
+    end
+    for _, tracker in trackers do ResetTracker(tracker) end
+    while Running() do
+        if not isrbxactive() then
+            wait(.5)
+        else
+            local now = tick()
+            local started = os.clock()
+            GrowLines()
+            GrowTexts()
+            GrowTriangles()
+            if now >= world.NextRefresh then
+                world.NextRefresh = now + .5
+                RefreshWorld(now)
+            end
+            if now >= nextMapCheck then
+                nextMapCheck = now + 2
+                map = workspace:FindFirstChild("Map")
+                local address = map and map.Address
+                world.MapAddress = address
+                if address ~= mapAddress then
+                    mapAddress = address
+                    RestartWindows(now)
+                    for _, tracker in trackers do ResetTracker(tracker) end
+                end
+            end
+            UpdateTracker(trackers.Generators, map, now)
+            if bGeneratorESP or bInfoHud then UpdateGenerators(tick()) end
+            if trackers.Generators.Address ~= generatorFolder then
+                generatorFolder = trackers.Generators.Address
+                RestartWindows(tick())
+            end
+            if bPalletESP or bAutoPallet then
+                UpdateTracker(trackers.Pallets, map, now)
+                UpdatePallets(tick())
+            end
+            if bAutoPallet then UpdateAutoPallet(tick()) end
+            if bAutoCrouch then UpdateAutoCrouch(tick()) else ReleaseCrouch() end
+            if bZombieESP then UpdateZombiePositions() end
+            if bInfoHud then UpdateInfoHud(tick()) end
+            if bWindowESP and map and stableScans < windowStableScans and tick() >= nextWindowScan then
+                local count = ScanWindows(map)
+                if count and count >= minimumWindows and count == windowCount then
+                    stableScans += 1
+                    if stableScans >= windowStableScans then print("[MatchaVD] " .. count .. " windows, scanning stopped") end
+                else
+                    stableScans = 0
+                end
+                windowCount = count or windowCount
+                nextWindowScan = tick() + windowScanInterval
+            end
+            if bDebugStats then
+                stats.Loops += 1
+                stats.LoopTime += os.clock() - started
+                PrintStats(tick())
+            end
+            task.wait(loopInterval)
+        end
+    end
+end)
+
+task.spawn(function()
+    local player = game:GetService("Players").LocalPlayer
+    local guiRotationOffset = visibleOffset - 0x19
+    local check, line, goal
+    local nextFind = 0
+    local pressed, lastNeedle, lastGoal, step = false, 0, 0, 0
+
+    local function Find()
+        local gui = player:FindFirstChild("PlayerGui")
+        gui = gui and gui:FindFirstChild("SkillCheckPromptGui")
+        check = gui and gui:FindFirstChild("Check")
+        line = check and check:FindFirstChild("Line")
+        goal = check and check:FindFirstChild("Goal")
+    end
+
+    while Running() do
+        if not bAutoSkillCheck or not isrbxactive() then
+            wait(.5)
+        else
+            local now = tick()
+            if not (check and line and goal) and now >= nextFind then
+                nextFind = now + 2
+                Find()
+            end
+            if check and line and goal then
+                if memory_read("byte", check.Address + visibleOffset) == 1 then
+                    local needle = memory_read("float", line.Address + guiRotationOffset)
+                    local goalRotation = memory_read("float", goal.Address + guiRotationOffset)
+                    if needle < lastNeedle - 30 or math.abs(goalRotation - lastGoal) > 1 then
+                        pressed, step = false, 0
+                    elseif needle > lastNeedle then
+                        step = needle - lastNeedle
+                    end
+                    lastNeedle, lastGoal = needle, goalRotation
+                    local target = goalRotation + skillCheckAngle
+                    if not pressed and step > 0 and needle + step / 2 >= target and needle <= goalRotation + 114 then
+                        pressed = true
+                        keypress(0x20)
+                        task.spawn(function()
+                            wait(.03)
+                            keyrelease(0x20)
+                        end)
+                    end
+                else
+                    pressed, lastNeedle, step = false, 0, 0
+                end
+            end
+            stats.Skill += 1
+            task.wait(if pressed or lastNeedle == 0 then .05 else 0)
+        end
+    end
+end)
+
+if type(UI) == "table" and type(UI.AddTab) == "function" then
+    local tabName = "Violence District"
+    local defaults = {
+        vd_gen = bGeneratorESP,
+        vd_kicked = bKickedColor,
+        vd_pal = bPalletESP,
+        vd_win = bWindowESP,
+        vd_trap = bTrapESP,
+        vd_zombie = bZombieESP,
+        vd_hud = bInfoHud,
+        vd_hl_dist = highlightDistance,
+        vd_hl_fill = bHighlightFill,
+        vd_hl_outline = bHighlightOutline,
+        vd_skill = bAutoSkillCheck,
+        vd_fv_enabled = bFastVault,
+        vd_fv_distance = fastVaultDistance,
+        vd_fv_angle = fastVaultAngle,
+        vd_fv_speed = fastVaultSpeed,
+        vd_auto_pallet = bAutoPallet,
+        vd_crouch = bAutoCrouch,
+    }
+    local apply = {
+        vd_gen = function(v) bGeneratorESP = v == true end,
+        vd_kicked = function(v) bKickedColor = v == true end,
+        vd_pal = function(v) bPalletESP = v == true end,
+        vd_win = function(v) bWindowESP = v == true end,
+        vd_trap = function(v) bTrapESP = v == true end,
+        vd_zombie = function(v) bZombieESP = v == true end,
+        vd_hud = function(v) bInfoHud = v == true end,
+        vd_hl_dist = function(v) highlightDistance = math.clamp(tonumber(v) or 1000, 25, 1000) end,
+        vd_hl_fill = function(v) bHighlightFill = v == true end,
+        vd_hl_outline = function(v) bHighlightOutline = v == true end,
+        vd_skill = function(v) bAutoSkillCheck = v == true end,
+        vd_fv_enabled = function(v) SetFastVaultEnabled(v) end,
+        vd_fv_distance = function(v) SetFastVaultOption("distance", v) end,
+        vd_fv_angle = function(v) SetFastVaultOption("angle", v) end,
+        vd_fv_speed = function(v) SetFastVaultOption("speed", v) end,
+        vd_auto_pallet = function(v) bAutoPallet = v == true end,
+        vd_crouch = function(v) bAutoCrouch = v == true end,
+    }
+    local colours = {
+        vd_gen_col = function(c) generatorColor = c end,
+        vd_gen_done = function(c) completedColor = c end,
+        vd_kicked_col = function(c) regressingColor = c end,
+        vd_pal_col = function(c) palletColor = c end,
+        vd_win_col = function(c) windowColor = c end,
+        vd_trap_col = function(c) trapColor = c end,
+        vd_zombie_col = function(c) zombieColor = c end,
+    }
+
+    local function AsColour(value)
+        if typeof(value) == "Color3" then return value end
+        if type(value) == "table" then
+            if type(value.R) == "number" then return Color3.new(value.R, value.G, value.B) end
+            if type(value[1]) == "number" then return Color3.fromRGB(value[1], value[2], value[3]) end
+        end
         return nil
     end
 
-    if camNow then
-        local dx, dy, dz = camNow.X - cx, camNow.Y - cy, camNow.Z - cz
-        local ox = math.max(math.abs(dx * rX + dy * rY + dz * rZ) - hx, 0)
-        local oy = math.max(math.abs(dx * uX + dy * uY + dz * uZ) - hy, 0)
-        local oz = math.max(math.abs(dx * bX + dy * bY + dz * bZ) - hz, 0)
-        if ox * ox + oy * oy + oz * oz < 1.44
-            or (maxX - minX) > camVpW * 4 or (maxY - minY) > camVpH * 4 then
-            hideSlot(e)
+    local widgetErrors, reported = {}, {}
+
+    local function Widget(section, method, key, ...)
+        local fn = section and section[method]
+        if type(fn) ~= "function" then
+            widgetErrors[key] = widgetErrors[key] or (method .. " is not a function on the section")
             return nil
         end
+        local ok, result = pcall(fn, section, ...)
+        if not ok then widgetErrors[key] = widgetErrors[key] or tostring(result) end
+        return result
     end
 
-    local lf, lt, lth, lcol, lvis = e.lf, e.lt, e.lth, e.lcol, e.lvis
-    local shown, topY, botY = 0, math.huge, -math.huge
-    for i = 1, 8 do
-        local y = py[i]
-        if y then
-            if y < topY then topY = y end
-            if y > botY then botY = y end
-        end
-    end
-    for i = 1, 12 do
-        local ed = EDGES[i]
-        local ia, ib = ed[1], ed[2]
-        local x1, y1, x2, y2 = px[ia], py[ia], px[ib], py[ib]
-        local ln = e.lines[i]
-        if x1 and y1 and x2 and y2 then
-            local f = lf[i]
-            if not f or f[1] ~= x1 or f[2] ~= y1 then
-                ln.From = Vector2.new(x1, y1)
-                if f then f[1], f[2] = x1, y1 else lf[i] = { x1, y1 } end
-            end
-            local t = lt[i]
-            if not t or t[1] ~= x2 or t[2] ~= y2 then
-                ln.To = Vector2.new(x2, y2)
-                if t then t[1], t[2] = x2, y2 else lt[i] = { x2, y2 } end
-            end
-            if lth[i] ~= thick then lth[i] = thick; ln.Thickness = thick end
-            if lcol[i] ~= colour then
-                lcol[i] = colour
-                ln.Color = colour
-                ln.Transparency = 1
-            end
-            if not lvis[i] then lvis[i] = true; ln.Visible = true end
-            shown = shown + 1
-        elseif lvis[i] then
-            lvis[i] = false
-            ln.Visible = false
-        end
-    end
-
-    if fillAlpha and e.tris and frontN == 8 and (botY - topY) >= 26 then
-        local hullPts = {}
-        for i = 1, 8 do
-            local x, y = px[i], py[i]
-            if x then hullPts[#hullPts + 1] = { x = x, y = y } end
-        end
-        local hull = convexHull(hullPts)
-        local tri = 0
-        if hull then
-            for i = 2, #hull - 1 do
-                if tri >= 6 then break end
-                tri = tri + 1
-                local t = e.tris[tri]
-                t.PointA = Vector2.new(hull[1].x, hull[1].y)
-                t.PointB = Vector2.new(hull[i].x, hull[i].y)
-                t.PointC = Vector2.new(hull[i + 1].x, hull[i + 1].y)
-                t.Color = colour
-                t.Transparency = fillAlpha
-                t.Visible = true
-            end
-        end
-        for i = tri + 1, 6 do
-            if e.tris[i].Visible then e.tris[i].Visible = false end
-        end
-    elseif e.tris and e.tris[1].Visible then
-        for i = 1, 6 do e.tris[i].Visible = false end
-    end
-
-    if shown == 0 then return nil end
-    return topY
-end
-
-local function lerpColor(a, b, t)
-    t = math.clamp(t, 0, 1)
-    return Color3.new(a.R + (b.R - a.R) * t, a.G + (b.G - a.G) * t, a.B + (b.B - a.B) * t)
-end
-
-local function isPart(inst)
-    local c = inst.ClassName
-    return c == "Part" or c == "MeshPart" or c == "UnionOperation" or c == "WedgePart"
-        or c == "CornerWedgePart" or c == "TrussPart"
-end
-
-local function lower(s) return string.lower(tostring(s)) end
-
-local genPool, genList, genGeo, genStamp = {}, {}, {}, nil
-local genShown = 0
-
-
-
--- generators
-local GEN_SKIP = { "hitbox", "point", "anchor", "handle", "invis" }
-
-local function skippedName(name)
-    local n = lower(name)
-    for _, s in ipairs(GEN_SKIP) do
-        if n:find(s, 1, true) then return true end
-    end
-    return false
-end
-
-local function attrNum(model, name)
-    local ok, v = pcall(function() return model:GetAttribute(name) end)
-    if ok and type(v) == "number" then return v end
-end
-
-local function attrBool(model, name)
-    local ok, v = pcall(function() return model:GetAttribute(name) end)
-    if ok and type(v) == "boolean" then return v end
-end
-
-local function genStateFrom(prog, crew, model)
-    if prog >= 100 or attrBool(model, "Completed") == true then return "done" end
-    if attrBool(model, "Regressing") == true then return "regress" end
-    if attrBool(model, "ProgressPaused") == true then return "paused" end
-    if crew > 0 then return "active" end
-    return "idle"
-end
-
-local function genState(model)
-    local prog = attrNum(model, "RepairProgress") or 0
-    local crew = attrNum(model, "PlayersRepairingCount") or 0
-    return prog, crew, genStateFrom(prog, crew, model)
-end
-
-local function firstPart(model)
-    local ok, kids = pcall(function() return model:GetChildren() end)
-    if not ok or type(kids) ~= "table" then return nil end
-    for _, c in ipairs(kids) do
-        if isPart(c) then return c end
-    end
-    for _, c in ipairs(kids) do
-        local ok2, sub = pcall(function() return c:GetChildren() end)
-        if ok2 then
-            for _, s in ipairs(sub) do
-                if isPart(s) then return s end
-            end
-        end
-    end
-    return nil
-end
-
-local function visibleBody(part)
-    local ok, tr = pcall(function() return part.Transparency end)
-    if ok and type(tr) == "number" and tr >= 0 and tr <= 1 and tr > 0.05 then return false end
-    return true
-end
-
-local function measureModel(model)
-    local ok, desc = pcall(function() return model:GetDescendants() end)
-    if not ok or type(desc) ~= "table" then return nil end
-
-    local mnX, mnY, mnZ = math.huge, math.huge, math.huge
-    local mxX, mxY, mxZ = -math.huge, -math.huge, -math.huge
-    local rotPart, any = nil, false
-
-    for _, part in ipairs(desc) do
-        if isPart(part) and not skippedName(part.Name) and visibleBody(part) then
-            local okp, p = pcall(function() return part.Position end)
-            local oks, s = pcall(function() return part.Size end)
-            if okp and oks and p and s then
-                local hx, hy, hz = s.X * 0.5, s.Y * 0.5, s.Z * 0.5
-                if hx >= 0.02 and hx <= 100 then
-                    if p.X - hx < mnX then mnX = p.X - hx end
-                    if p.X + hx > mxX then mxX = p.X + hx end
-                    if p.Y - hy < mnY then mnY = p.Y - hy end
-                    if p.Y + hy > mxY then mxY = p.Y + hy end
-                    if p.Z - hz < mnZ then mnZ = p.Z - hz end
-                    if p.Z + hz > mxZ then mxZ = p.Z + hz end
-                    any = true
-                    if not rotPart then rotPart = part end
-                end
-            end
-        end
-    end
-    if not any then return nil end
-
-    local center = Vector3.new((mnX + mxX) * 0.5, (mnY + mxY) * 0.5, (mnZ + mxZ) * 0.5)
-    local hx, hy, hz = (mxX - mnX) * 0.5, (mxY - mnY) * 0.5, (mxZ - mnZ) * 0.5
-    if hx < 0.05 or hy < 0.05 then return nil end
-    if hx > 7 or hy > 7 or hz > 7 then return nil end
-
-    local okcf, cf = pcall(function() return rotPart.CFrame end)
-    if not okcf then cf = nil end
-    return center, hx, hy, hz, cf
-end
-
-local function collectGens()
-    local out = {}
-    local map = Workspace:FindFirstChild("Map")
-    if not map then return out end
-
-    local folder
-    local okKids, kids = pcall(function() return map:GetChildren() end)
-    if not okKids or type(kids) ~= "table" then okKids, kids = false, {} end
-
-    local parents = { kids }
-    local okRes, res = pcall(function() return map:FindFirstChild("resources") end)
-    if okRes and res then
-        local okSub, sub = pcall(function() return res:GetChildren() end)
-        if okSub and type(sub) == "table" then parents[#parents + 1] = sub end
-    end
-
-    for _, list in ipairs(parents) do
-        if folder then break end
-        for _, ch in ipairs(list) do
-            local n = lower(ch.Name)
-            if ch.ClassName == "Folder"
-                and (n:find("generator", 1, true) or n:find("gens", 1, true)) then
-                local okSub, sub = pcall(function() return ch:GetChildren() end)
-                if okSub and type(sub) == "table" and #sub > 0 then folder = ch break end
-            end
-        end
-    end
-
-    local function note(model)
-        local part = model:FindFirstChild("HitBox")
-            or model:FindFirstChild("RootPart")
-            or model:FindFirstChild("GeneratorBody")
-            or firstPart(model)
-        if not part then return end
-        local okp, pos = pcall(function() return part.Position end)
-        if not okp or not pos then return end
-        local prog, crew, state = genState(model)
-        local okA, addr = pcall(function() return model.Address end)
-        out[#out + 1] = {
-            model = model, key = okA and addr or nil,
-            pos = pos, prog = prog, crew = crew, state = state, stateAt = 0,
-        }
-    end
-
-    if folder then
-        local ok, items = pcall(function() return folder:GetChildren() end)
-        if ok then
-            for _, m in ipairs(items) do
-                if attrNum(m, "RepairProgress") or attrNum(m, "PlayersRepairingCount")
-                    or attrNum(m, "Progress") then
-                    note(m)
-                end
-            end
-        end
-        return out
-    end
-
-    if not okKids then return out end
-    for _, ch in ipairs(kids) do
-        if attrNum(ch, "RepairProgress") or attrNum(ch, "PlayersRepairingCount") then
-            note(ch)
-        else
-            local okSub, sub = pcall(function() return ch:GetChildren() end)
-            if okSub then
-                for _, s in ipairs(sub) do
-                    if attrNum(s, "RepairProgress") then note(s) end
-                end
-            end
-        end
-    end
-    return out
-end
-
-local genCursor = 1
-local function updateGenStates(list)
-    local n = #list
-    if n == 0 then return end
-    local now = os.clock()
-    for _ = 1, n do
-        genCursor = genCursor % n + 1
-        local t = list[genCursor]
-        if t and t.model then
-            local okp, prog = pcall(function() return t.model:GetAttribute("RepairProgress") end)
-            local okc, crew = pcall(function() return t.model:GetAttribute("PlayersRepairingCount") end)
-            if okp and type(prog) == "number" then
-                t.prog = prog
-            end
-            if okc and type(crew) == "number" then t.crew = crew end
-            if now >= (t.stateAt or 0) then
-                t.stateAt = now + 1.5
-                t.state = genStateFrom(t.prog or 0, t.crew or 0, t.model)
-            end
-            return
-        end
-    end
-end
-
-local function genColour(prog, state)
-    if state == "regress" then return CFG.genBrokenColour end
-    if state == "paused" then return COL.genPause end
-    return lerpColor(CFG.genIdleColour, CFG.genDoneColour, (prog or 0) / 100)
-end
-
-local function drawGens(camPos, now)
-    local n = 0
-    local range = CFG.genRange
-    local rangeSq = range * range
-
-    for i = 1, #genList do
-        if n >= CFG.genPool then break end
-        local t = genList[i]
-
-        local dx, dy, dz = t.center.X - camPos.X, t.center.Y - camPos.Y, t.center.Z - camPos.Z
-        local d2 = dx * dx + dy * dy + dz * dz
-        if d2 <= rangeSq then
-            local nextSlot = n + 1
-            local e = genPool[nextSlot]
-            if not e then break end
-
-            local okEntry = pcall(function()
-                local d = math.sqrt(d2)
-                local colour = genColour(t.prog, t.state)
-                local topY
-
-                if CFG.namesOnly then
-                    hideBox(e)
-                else
-                    local okBox
-                    okBox, topY = pcall(drawBox, e, t.center, t.hx, t.hy, t.hz,
-                        t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
-                        colour, CFG.genFill and CFG.genFillA or nil, CFG.genThick)
-                    if not okBox then topY = nil end
-                end
-
-                local top, okT = WorldToScreen(t.center + Vector3.new(0, t.hy, 0))
-                local bot, okB = WorldToScreen(t.center - Vector3.new(0, t.hy, 0))
-                if okT and okB and top and bot then
-                    local pct, dm = math.floor(t.prog + 0.5), math.floor(d + 0.5)
-                    if e.lpct ~= pct or e.ldm ~= dm or e.lstate ~= t.state or e.lcrew ~= t.crew
-                        or e.lnames ~= CFG.names then
-                        e.lpct, e.ldm, e.lstate, e.lcrew, e.lnames = pct, dm, t.state, t.crew, CFG.names
-
-                        local line1 = CFG.names and string.format("GEN %d%%   %dm", pct, dm)
-                            or string.format("%d%%", pct)
-                        local line2 = ""
-                        if CFG.genState and CFG.names then
-                            line2 = t.state
-                            if t.crew > 0 then line2 = line2 .. "  x" .. t.crew end
-                        end
-                        if e.lastTop ~= line1 then e.lastTop = line1; e.top.Text = line1 end
-                        if e.lastSub ~= line2 then e.lastSub = line2; e.sub.Text = line2 end
-                    end
-
-                    if e.col ~= colour then
-                        e.col = colour
-                        e.top.Color = colour
-                        e.sub.Color = colour
-                    end
-
-                    e.top.Position = Vector2.new(top.X,
-                        (topY and topY < 100000) and (topY - 18) or (top.Y - 18))
-                    e.top.Visible = true
-
-                    if e.lastSub and e.lastSub ~= "" then
-                        e.sub.Position = Vector2.new(top.X, bot.Y + 2)
-                        e.sub.Visible = true
-                    elseif e.sub.Visible then
-                        e.sub.Visible = false
-                    end
-                else
-                    if e.top.Visible then e.top.Visible = false end
-                    if e.sub.Visible then e.sub.Visible = false end
-                end
-            end)
-
-            if okEntry then
-                n = nextSlot
-            else
-                pcall(hideSlot, e)
-            end
-        end
-    end
-
-    if genShown > n then
-        for i = n + 1, genShown do pcall(hideSlot, genPool[i]) end
-    end
-    genShown = n
-    return n
-end
-
-
-local trapPool, trapList = {}, {}
-local trapShown = 0
-
-
--- bear traps
-local trapIndex, trapTrapped, trapVictimAt = {}, {}, 0
-
-local TRAP_VICTIM_ATTRS = {
-    "TrappedPlayer", "TrappedUser", "PlayerName", "Player", "Occupant", "User", "Caught",
-}
-
-local function trapArmed(inst)
-    local ok, v = pcall(function() return inst:GetAttribute("Armed") end)
-    if ok and type(v) == "boolean" then return v end
-end
-
-local function trapAddress(inst)
-    local ok, a = pcall(function() return inst.Address end)
-    return (ok and type(a) == "number" and a ~= 0) and a or nil
-end
-
-local function trapMeasure(inst)
-    local mnX, mnY, mnZ = math.huge, math.huge, math.huge
-    local mxX, mxY, mxZ = -math.huge, -math.huge, -math.huge
-    local rot, any = nil, false
-
-    local function note(part)
-        local okp, p = pcall(function() return part.Position end)
-        local oks, s = pcall(function() return part.Size end)
-        if not okp or not oks or not p or not s then return end
-        local hx, hy, hz = s.X * 0.5, s.Y * 0.5, s.Z * 0.5
-        if hx <= 0 or hy <= 0 or hz <= 0 or hx > 8 or hy > 8 or hz > 8 then return end
-        if p.X - hx < mnX then mnX = p.X - hx end
-        if p.X + hx > mxX then mxX = p.X + hx end
-        if p.Y - hy < mnY then mnY = p.Y - hy end
-        if p.Y + hy > mxY then mxY = p.Y + hy end
-        if p.Z - hz < mnZ then mnZ = p.Z - hz end
-        if p.Z + hz > mxZ then mxZ = p.Z + hz end
-        any = true
-        if not rot then rot = part end
-    end
-
-    if isPart(inst) then note(inst) end
-    local ok, desc = pcall(function() return inst:GetDescendants() end)
-    if ok and type(desc) == "table" then
-        for _, part in ipairs(desc) do
-            if part ~= inst and isPart(part) then note(part) end
-        end
-    end
-    if not any then return nil end
-
-    local center = Vector3.new((mnX + mxX) * 0.5, (mnY + mxY) * 0.5, (mnZ + mxZ) * 0.5)
-    local hx, hy, hz = (mxX - mnX) * 0.5, (mxY - mnY) * 0.5, (mxZ - mnZ) * 0.5
-    if hx < 0.05 or hy < 0.02 or hz < 0.05 then return nil end
-
-    local right, up, back = R_AXIS, U_AXIS, B_AXIS
-    if rot then
-        local okc, cf = pcall(function() return rot.CFrame end)
-        if okc and cf then right, up, back = basisFromCFrame(cf) end
-    end
-    return center, hx, hy, hz, right, up, back
-end
-
-local trapRootMap, trapRootCache, trapRootRefreshAt = nil, {}, 0
-local function trapRoots(map)
-    local now = os.clock()
-    if map ~= trapRootMap or now >= trapRootRefreshAt then
-        trapRootMap = map
-        trapRootRefreshAt = now + 10
-        local out = {}
-        local okKids, kids = pcall(function() return map:GetChildren() end)
-        if not okKids or type(kids) ~= "table" then kids = {} end
-        for _, ch in ipairs(kids) do
-            local n = lower(ch.Name)
-            if n == "beartrap" or n == "beartraps" then out[#out + 1] = ch end
-        end
-        -- Recursive discovery is expensive on large maps; do it only when
-        -- the direct-child lookup finds nothing, and cache the result for 10s.
-        if #out == 0 then
-            local ok, found = pcall(function() return map:FindFirstChild("BearTrap", true) end)
-            if ok and found then out[1] = found end
-        end
-        trapRootCache = out
-    end
-    return trapRootCache
-end
-
-local function collectTraps()
-    local map = Workspace:FindFirstChild("Map")
-    if not map then
-        trapIndex = {}
-        trapRootMap, trapRootCache, trapRootRefreshAt = nil, {}, 0
-        return {}
-    end
-
-    local out, nextIndex, now = {}, {}, os.clock()
-
-    local function add(inst, armed)
-        local id = trapAddress(inst)
-        -- Some executor wrappers expose Address inconsistently. Cache by the
-        -- instance itself when no numeric Address exists, avoiding a full
-        -- GetDescendants/geometry scan on every trap refresh.
-        local cacheKey = id or inst
-        local entry = trapIndex[cacheKey]
-        if not entry then
-            local center, hx, hy, hz, right, up, back = trapMeasure(inst)
-            if not center then return end
-            entry = { pos = center, hx = hx, hy = hy, hz = hz,
-                      right = right, up = up, back = back }
-        end
-        entry.id, entry.model = id, inst
-        if entry.armed ~= armed then
-            entry.armed = armed
-            if armed == false then
-                entry.sprungAt = now
-                if not entry.probed then
-                    entry.probed = true
-                    for i = 1, #TRAP_VICTIM_ATTRS do
-                        local ok, v = pcall(function() return inst:GetAttribute(TRAP_VICTIM_ATTRS[i]) end)
-                        if ok and type(v) == "string" and v ~= "" then
-                            entry.attrVictim = v
-                            break
-                        end
-                    end
-                end
-            end
-        end
-        nextIndex[cacheKey] = entry
-        out[#out + 1] = entry
-    end
-
-    local function walk(inst, depth)
-        if not inst or depth > 3 then return end
-        local armed = trapArmed(inst)
-        if armed ~= nil then
-            add(inst, armed)
-            return
-        end
-        local ok, kids = pcall(function() return inst:GetChildren() end)
-        if not ok or type(kids) ~= "table" then return end
-        for _, k in ipairs(kids) do walk(k, depth + 1) end
-    end
-
-    local roots = trapRoots(map)
-    for _, r in ipairs(roots) do walk(r, 0) end
-    trapIndex = nextIndex
-    return out
-end
-
-local function trapScanTrapped(now)
-    if now - trapVictimAt < 1.5 then return end
-    trapVictimAt = now
-    local out = {}
-    local ok, list = pcall(function() return Players:GetPlayers() end)
-    if not ok or type(list) ~= "table" then trapTrapped = out return end
-    local myId
-    pcall(function() myId = lp.UserId end)
-    for _, plr in ipairs(list) do
-        local char
-        pcall(function() char = plr.Character end)
-        if char then
-            local okT, trapped = pcall(function() return char:GetAttribute("Trapped") end)
-            if okT and trapped == true then
-                local root
-                pcall(function() root = char:FindFirstChild("HumanoidRootPart") end)
-                local okp, pos = false, nil
-                if root then okp, pos = pcall(function() return root.Position end) end
-                if okp and pos then
-                    out[#out + 1] = {
-                        name = tostring(plr.Name), pos = pos,
-                        self = (myId ~= nil and plr.UserId == myId),
-                    }
-                end
-            end
-        end
-    end
-    trapTrapped = out
-end
-
-local function trapVictim(t)
-    if t.attrVictim then return t.attrVictim end
-    local best, bestD2
-    for i = 1, #trapTrapped do
-        local v = trapTrapped[i]
-        local dx, dy, dz = v.pos.X - t.pos.X, v.pos.Y - t.pos.Y, v.pos.Z - t.pos.Z
-        local d2 = dx * dx + dy * dy + dz * dz
-        if d2 <= 225 and (not bestD2 or d2 < bestD2) then best, bestD2 = v, d2 end
-    end
-    if not best then return nil end
-    return best.self and "you" or best.name
-end
-
-local function updateTrapVictimLabels()
-    for i = 1, #trapList do
-        local t = trapList[i]
-        if t.armed == false then
-            t.victimName = trapVictim(t)
-        else
-            t.victimName = nil
-        end
-    end
-end
-
-local function drawTraps(camPos)
-    local n = 0
-    local range = CFG.trapRange
-    local rangeSq = range * range
-
-    for i = 1, #trapList do
-        if n >= CFG.trapPool then break end
-        local t = trapList[i]
-        local dx, dy, dz = t.pos.X - camPos.X, t.pos.Y - camPos.Y, t.pos.Z - camPos.Z
-        local d2 = dx * dx + dy * dy + dz * dz
-
-        if d2 <= rangeSq then
-            local nextSlot = n + 1
-            local e = trapPool[nextSlot]
-            if not e then break end
-
-            local okEntry = pcall(function()
-                local d = math.sqrt(d2)
-                local colour = (t.armed == false) and CFG.trapSprungColour or CFG.trapArmedColour
-                local topY
-
-                if CFG.namesOnly then
-                    hideBox(e)
-                else
-                    topY = drawBox(e, t.pos, t.hx, t.hy, t.hz,
-                        t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
-                        colour, CFG.trapFill and CFG.trapFillA or nil, CFG.trapThick)
-                end
-
-                local top, okTop = WorldToScreen(t.pos + Vector3.new(0, t.hy + 1.2, 0))
-                if okTop and top and CFG.names then
-                    local text = string.format("BEAR TRAP  %dm", math.floor(d + 0.5))
-                    if t.armed == false then
-                        text = text .. "  " .. (t.victimName or "TRAPPED")
-                    end
-                    if e.lastTop ~= text then e.lastTop = text; e.top.Text = text end
-                    if e.col ~= colour then e.col = colour; e.top.Color = colour end
-                    e.top.Position = Vector2.new(top.X,
-                        (topY and topY < 100000) and (topY - 16) or (top.Y - 16))
-                    e.top.Visible = true
-                elseif e.top.Visible then
-                    e.top.Visible = false
-                end
-            end)
-
-            if okEntry then
-                n = nextSlot
-            else
-                -- Clear the damaged slot and continue with the next target.
-                pcall(hideSlot, e)
-            end
-        end
-    end
-
-    if trapShown > n then
-        for i = n + 1, trapShown do pcall(hideSlot, trapPool[i]) end
-    end
-    trapShown = n
-    return n
-end
-
--- skillcheck
-local MEM_BASE = (type(getbase) == "function") and select(2, pcall(getbase)) or nil
-local _memOk, _memChk = false, -1
-
-local function unsafeOn()
-    local now = tick()
-    if now - _memChk > 1 then
-        _memChk = now
-        if MEM_BASE then
-            local ok, b = pcall(memory_read, "byte", MEM_BASE)
-            _memOk = ok and b == 77
-        else
-            _memOk = false
-        end
-    end
-    return _memOk
-end
-
-local function rdf(a)
-    local ok, v = pcall(memory_read, "float", a)
-    if ok and type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge then
-        return v
-    end
-end
-
-local function scFinite(v)
-    return type(v) == "number" and v == v and math.abs(v) < 1000000
-end
-
-local function scAngleAt(inst, off)
-    if not inst or not off then return nil end
-    local a = inst.Address + off
-    local angle, sn, cs = rdf(a), rdf(a + 4), rdf(a + 8)
-    if not scFinite(angle) or not sn or not cs then return nil end
-    if math.abs(sn * sn + cs * cs - 1) > 0.02 then return nil end
-    local rad = math.rad(angle % 360)
-    if math.abs(sn - math.sin(rad)) < 0.02 and math.abs(cs - math.cos(rad)) < 0.02 then
-        return angle
-    end
-
-    if math.abs(sn - math.sin(angle)) < 0.02 and math.abs(cs - math.cos(angle)) < 0.02 then
-        return math.deg(angle) % 360
-    end
-    return nil
-end
-
-local SC_OFF = 0xD0
-
-local scTrack = { trace = {} }
-local scGui = {
-    refreshAt = 0, off = SC_OFF, verified = false, scanAt = 0, scanOff = 0x40,
-    knownCheckAt = 0, ids = "",
-    line = nil, goal = nil, trapGoal = nil, trapPerfect = nil,
-}
-local scInput, scInputAt = nil, 0
-local scStats = {
-    checks = 0, hits = 0, misses = 0, rescues = 0, errors = 0,
-    events = {},
-    mode = "--", offset = "0xD0", status = "starting", hz = 0,
-    line = nil, goal = nil, phase = nil, window = "--",
-    samples = 0, peakStep = 0, fireAt = nil, trace = {},
-}
-
-local scPressToken = 0
-local function scPlanDelay()
-    local base = (tonumber(CFG.scReact) or 0) + (tonumber(CFG.scDelay) or 0)
-    if CFG.scHum then
-        local a = tonumber(CFG.scHumMin) or 10
-        local b = tonumber(CFG.scHumMax) or 50
-        if b < a then a, b = b, a end
-        base = base + a + math.random() * (b - a)
-    end
-    return math.clamp(base, 0, 600) / 1000
-end
-
-local function scResetCheck()
-    scTrack.fired, scTrack.rescued, scTrack.missed = false, false, false
-    scTrack.pending = nil
-    scTrack.trace = {}
-    scTrack.delay = scPlanDelay()
-    scTrack.scheduled = false
-    scStats.delayMs = math.floor(scTrack.delay * 1000 + 0.5)
-    scPressToken = scPressToken + 1
-    scStats.trace = scTrack.trace
-    scStats.samples, scStats.peakStep, scStats.fireAt = 0, 0, nil
-end
-
-local function scAngleRaw(inst, off)
-    if not inst or not off then return nil end
-    local v = rdf(inst.Address + off)
-    if scFinite(v) and math.abs(v) < 100000 then return v end
-    return nil
-end
-
-local function scTrapped()
-    local ch = lp.Character
-    if not ch then return false end
-    local ok, v = pcall(function() return ch:GetAttribute("Trapped") end)
-    return ok and v == true
-end
-
-local function scAlignBase(goalRot, needle)
-    local v = goalRot - 168
-    local k = math.floor((needle - v) / 360 + 0.5)
-    return v + k * 360
-end
-
-local function scBind(now)
-    if now < scGui.refreshAt then return end
-    scGui.refreshAt = now + 0.2
-
-    local pg = lp:FindFirstChild("PlayerGui")
-    local check = nil
-
-    local names = (lp:GetAttribute("platform") == "Console")
-        and { "SkillCheckPromptGui-con", "SkillCheckPromptGui" }
-        or { "SkillCheckPromptGui", "SkillCheckPromptGui-con" }
-    for _, name in ipairs(names) do
-        local g = pg and pg:FindFirstChild(name)
-        local c = g and g:FindFirstChild("Check")
-        if c and c:FindFirstChild("Line") then check = c; break end
-    end
-
-    local line = check and check:FindFirstChild("Line")
-    local goal = check and check:FindFirstChild("Goal")
-    local tg   = check and check:FindFirstChild("TrapGoal")
-    local tp   = check and check:FindFirstChild("TrapPerfect")
-
-    local ids = table.concat({
-        tostring(line and line.Address), tostring(goal and goal.Address),
-        tostring(tg and tg.Address), tostring(tp and tp.Address),
-    }, ":")
-
-    if ids ~= scGui.ids then
-        scGui.ids = ids
-        scTrack = { trace = {} }
-        scGui.verified = false
-        scGui.off = SC_OFF
-        scGui.scanOff = 0x40
-        scGui.scanAt = 0
-        scGui.knownCheckAt = 0
-    end
-    scGui.line, scGui.goal, scGui.trapGoal, scGui.trapPerfect = line, goal, tg, tp
-end
-
-local function scEnsureOff(now)
-    if scGui.verified then return scGui.off end
-    if not scGui.line or not scGui.goal then return nil end
-
-    -- Check the known offset first. If it is not valid, probe only a few
-    -- candidates per pass; the previous full scan could issue >1,400 memory
-    -- reads in a single tick and freeze the executor during a skill check.
-    if now >= (scGui.knownCheckAt or 0) then
-        scGui.knownCheckAt = now + 0.25
-        local knownOk = false
-        local okKnown = pcall(function()
-            knownOk = scAngleAt(scGui.line, SC_OFF) ~= nil
-                and scAngleAt(scGui.goal, SC_OFF) ~= nil
+    local function Picker(section, id, colour)
+        Widget(section, "ColorPicker", id, id, colour.R, colour.G, colour.B, 1, function(value)
+            local picked = AsColour(value)
+            if picked then colours[id](picked) end
         end)
-        if okKnown and knownOk then
-            scGui.off, scGui.verified = SC_OFF, true
-            scStats.offset = string.format("0x%X", SC_OFF)
-            return SC_OFF
-        end
     end
 
-    if now < scGui.scanAt then return nil end
-    scGui.scanAt = now + 0.05
-    local checked = 0
-    while checked < 4 do
-        local off = scGui.scanOff or 0x40
-        if off > 0x400 then
-            scGui.scanOff = 0x40
-            scGui.scanAt = now + 1.0
-            break
-        end
-        scGui.scanOff = off + 4
-        checked = checked + 1
-        if off ~= SC_OFF then
-            local found = false
-            local okCandidate = pcall(function()
-                found = scAngleAt(scGui.line, off) ~= nil
-                    and scAngleAt(scGui.goal, off) ~= nil
-            end)
-            if okCandidate and found then
-                scGui.off, scGui.verified = off, true
-                scStats.offset = string.format("0x%X", off)
-                return off
-            end
-        end
-    end
-    return nil
-end
-
-local SC_KEYS = {
-    Space=32, Tab=9, Return=13, Enter=13, Escape=27, Backspace=8,
-    Insert=45, Delete=46, Home=36, End=35, PageUp=33, PageDown=34,
-    Left=37, Up=38, Right=39, Down=40, CapsLock=20,
-    LeftShift=160, RightShift=161, LeftControl=162, RightControl=163,
-    LeftAlt=164, RightAlt=165, Minus=189, Equals=187, LeftBracket=219,
-    RightBracket=221, BackSlash=220, Semicolon=186, Quote=222,
-    Comma=188, Period=190, Slash=191, Backquote=192,
-    KeypadZero=96, KeypadOne=97, KeypadTwo=98, KeypadThree=99,
-    KeypadFour=100, KeypadFive=101, KeypadSix=102, KeypadSeven=103,
-    KeypadEight=104, KeypadNine=105, KeypadMultiply=106, KeypadPlus=107,
-    KeypadMinus=109, KeypadPeriod=110, KeypadDivide=111, KeypadEnter=13,
-}
-
-local function scInputFor(name, fallback)
-    if type(name) ~= "string" or name == "" then
-        local code = tonumber(fallback) or 32
-        return { code = code, name = code == 32 and "Space" or ("VK " .. tostring(code)) }
-    end
-    if name == "MouseButton1" or name == "MouseButton2" then
-        return { mouse = name == "MouseButton1" and 1 or 2, name = name }
-    end
-    local code = SC_KEYS[name]
-    if not code and #name == 1 and name:match("[%w]") then code = string.byte(name:upper()) end
-    local f = tonumber(name:match("^F(%d+)$"))
-    if not code and f and f >= 1 and f <= 24 then code = 111 + f end
-    return code and { code = code, name = name } or nil
-end
-
-local scHeld = nil
--- Fast Vault and Auto Skill Check share executor keyboard input.
--- This lock prevents Sprint from being re-pressed during a skill-check tap.
-local vaultReleaseSprint
-local vaultInputBusy = false
-local vaultBlockSprintUntil = 0
-
-local function scReleaseInput()
-    local held = scHeld
-    scHeld = nil
-    if not held then return end
-    if held.mouse == 1 then pcall(mouse1release)
-    elseif held.mouse == 2 then pcall(mouse2release)
-    else pcall(keyrelease, held.code) end
-end
-
-local function scPress(input)
-    -- Avoid a held Sprint key interfering with a skill-check key press.
-    vaultInputBusy = true
-    vaultBlockSprintUntil = os.clock() + 0.75
-    if vaultReleaseSprint then pcall(vaultReleaseSprint) end
-    scHeld = input
-    local ok, err
-    if input.mouse == 1 then ok, err = pcall(mouse1press)
-    elseif input.mouse == 2 then ok, err = pcall(mouse2press)
-    else ok, err = pcall(keypress, input.code) end
-    if ok then pcall(task.wait, 0.02) end
-    scReleaseInput()
-    vaultInputBusy = false
-    return ok, err
-end
-
-local scTick = { n = 0, t = os.clock() }
-local scWasEnabled = false
-
-
-local function scTrackSample(lr, d)
-    scStats.line = lr
-    if d and math.abs(d) > 0.0005 then
-        scStats.samples = scStats.samples + 1
-        if math.abs(d) > scStats.peakStep then scStats.peakStep = math.abs(d) end
-        if #scTrack.trace < 300 then scTrack.trace[#scTrack.trace + 1] = lr end
-    end
-end
-
-local function scSnapshot(base)
-    local copy = {}
-    local src = scTrack.trace or {}
-    for i = 1, #src do copy[i] = src[i] end
-    scStats.lastSweep = { base = base, n = #copy, samples = copy }
-end
-
-local scEventLog = {}
-local function scEvent(text)
-    scEventLog[#scEventLog + 1] = text
-    if #scEventLog > 12 then table.remove(scEventLog, 1) end
-    scStats.events = scEventLog
-end
-
-local function scDoPress(why)
-    if CFG.scDry then
-        scStats.hits = scStats.hits + 1
-        scStats.status = "dry " .. why
-        return
-    end
-    if not scInput then
-        scStats.status = "unsupported bind"
-        return
-    end
-    local ok, err = scPress(scInput)
-    if ok then
-        scStats.hits = scStats.hits + 1
-        scStats.status = "pressed " .. scInput.name .. " (" .. why .. ")"
-    else
-        scStats.errors = scStats.errors + 1
-        scStats.error = tostring(err)
-        scStats.status = "press failed"
-    end
-end
-
-local function scPressPlanned(why, angle)
-    local wait = scTrack.delayUse or scTrack.delay or 0
-    if wait <= 0.001 then
-        scDoPress(why)
-        return
-    end
-    -- Matcha's task.delay never fires (it is a deadline, not a scheduler), so a
-    -- planned press is parked here and serviced by the scStep tick instead.
-    scTrack.pending = {
-        at = os.clock() + wait,
-        token = scPressToken,
-        angle = angle,
-        why = string.format("%s +%.0fms", why, wait * 1000),
-        check = function()
-            local inst = scGui.line
-            if not inst then return false end
-            local cur = scAngleRaw(inst, scGui.off)
-            if cur and scTrack.goal then
-                if (cur - scTrack.goal) > 161 then return false end
-                return true
-            end
-            -- no readable angle: press unless we can prove the prompt is gone
-            local okp, parent = pcall(function() return inst.Parent end)
-            return not (okp and parent == nil)
-        end,
-    }
-end
-
-local function scStep()
-    scTick.n = scTick.n + 1
-    local now = os.clock()
-    if now - scTick.t >= 1 then
-        scStats.hz = scTick.n / (now - scTick.t)
-        scTick.n, scTick.t = 0, now
-    end
-
-    if not CFG.sc then
-        scWasEnabled = false
-        scStats.status = "disabled"
-        scReleaseInput()
-        return
-    end
-    if not unsafeOn() then
-        scWasEnabled = false
-        scStats.status = "unsafe lua off"
-        scReleaseInput()
-        return
-    end
-    if not scWasEnabled then
-        scWasEnabled = true
-        scTrack = { trace = {} }
-        scGui.refreshAt, scInputAt = 0, 0
-    end
-
-    scBind(now)
-
-    if now >= scInputAt then
-        scInputAt = now + 0.5
-        scInput = scInputFor(lp:GetAttribute("kb_skillcheck"), CFG.scKey)
-        scStats.key = scInput and scInput.name or "--"
-    end
-
-    -- planned press: a deadline serviced here, because task.delay never fires
-    local pending = scTrack.pending
-    if pending and now >= pending.at then
-        scTrack.pending = nil
-        local keep = (pending.token == nil) or (pending.token == scPressToken)
-        if keep and pending.check then keep = pending.check() end
-        if keep then
-            if pending.angle then scStats.fireAt = pending.angle end
-            scDoPress(pending.why)
-            now = os.clock()   -- the press holds the key for ~20ms
-        end
-    end
-
-    if not scGui.line then
-        scStats.status = "waiting for prompt"
-        scStats.mode = "--"
-        return
-    end
-
-    local off = scEnsureOff(now)
-    if not off then
-        scStats.status = "resolving gui"
-        return
-    end
-
-    local trap = (CFG.scMode == "trap") or (CFG.scMode == nil and scTrapped())
-    local mode = trap and "trap" or "gen"
-    if scTrack.mode ~= mode then
-        scTrack = { mode = mode, trace = {} }
-        scStats.mode = mode
-        scResetCheck()
-    end
-
-    local lr = scAngleRaw(scGui.line, off)
-    if not lr then
-        scStats.status = "read miss"
-        return
-    end
-
-    local prev = scTrack.lr
-    local d = nil
-    if prev ~= nil then
-        d = lr - prev
-        d = ((d + 180) % 360) - 180
-    end
-    scStats.moving = (d ~= nil and math.abs(d) > 0.0005)
-
-    local fired, why = false, nil
-
-    if mode == "trap" then
-
-        local tg = scAngleRaw(scGui.trapGoal, off)
-        local tp = scAngleRaw(scGui.trapPerfect, off)
-
-        local written = nil
-        if tg and scTrack.tg and math.abs(tg - scTrack.tg) > 0.5 then written = tg end
-        if tp and scTrack.tp and math.abs(tp - scTrack.tp) > 0.5 then written = tp end
-        local started = false
-        if written then
-            scTrack.base = scAlignBase(written, lr)
-            started = true
-        end
-        scTrack.tg, scTrack.tp = tg, tp
-
-        local moving = (d ~= nil and math.abs(d) > 0.0005)
-        local idle = (scTrack.lastMove == nil) or (now - scTrack.lastMove > 0.15)
-        if not started then
-            if scTrack.base ~= nil and lr < scTrack.base - 5 then
-                scTrack.base = lr
-                started = true
-            elseif moving and idle then
-                if scTrack.base == nil or (prev ~= nil and prev - scTrack.base > 290) then
-
-                    scTrack.base = prev or lr
-                    started = true
-                end
-            end
-        end
-        if moving then scTrack.lastMove = now end
-
-        if started and scTrack.base then
-
-            for _, g in ipairs({ tg, tp }) do
-                if g then
-                    local b = g - 168
-                    b = b + 360 * math.floor((scTrack.base - b) / 360 + 0.5)
-                    if math.abs(b - scTrack.base) <= 12 then scTrack.base = b; break end
-                end
-            end
-        end
-
-        if started then
-            scStats.checks = scStats.checks + 1
-            scResetCheck()
-            scTrack.speed, scTrack.sampleAt, scTrack.scheduled = nil, nil, false
-            scEvent(string.format("start base=%.1f lr=%.1f prev=%s tg=%s tp=%s",
-                scTrack.base, lr, tostring(prev), tostring(tg), tostring(tp)))
-        end
-
-        if moving and d ~= nil then
-            local dt = now - (scTrack.sampleAt or (now - 0.016))
-            if dt > 0.002 and dt < 0.3 then
-                local sp = d / dt
-                if sp > 20 then
-                    scTrack.speed = scTrack.speed and (scTrack.speed * 0.6 + sp * 0.4) or sp
-                end
-            end
-            scTrack.sampleAt = now
-        end
-
-        scTrackSample(lr, d)
-
-        scStats.trapBase = scTrack.base
-        if scTrack.base then
-            local phase = lr - scTrack.base
-            local lo, hi, good = 270, 286, 308
-            local leadAdj = math.clamp(tonumber(CFG.scLead) or 0, 0, (hi - lo) - 1)
-
-            local speed = scTrack.speed or 0
-            local want = scTrack.delay or 0
-            if speed > 20 then
-                local cap = (lo + leadAdj - 2) / speed
-                if cap > 0 and want > cap then want = cap end
-            end
-            scTrack.delayUse = want
-            local early = (speed > 20) and (want * speed) or 0
-            scStats.phase = phase
-            scStats.window = string.format("%.0f..%.0f", lo, hi)
-            if not scTrack.fired and not scTrack.missed then
-                if phase >= lo + leadAdj - early and phase <= hi then
-                    fired, why = true, "trap perfect"
-                elseif CFG.scRescue and phase > hi and phase <= good then
-                    fired, why = true, "trap good"
-                    scStats.rescues = scStats.rescues + 1
-                elseif phase > good + 2 then
-                    scTrack.missed = true
-                    scStats.misses = scStats.misses + 1
-                    scSnapshot(scTrack.base)
-                    scEvent(string.format("miss phase=%.1f base=%.1f lr=%.1f n=%d",
-                        phase, scTrack.base, lr, #scTrack.trace))
-                end
-
-                if not fired and not scTrack.scheduled and scTrack.speed
-                    and phase < lo and phase > -30 then
-                    local dt = (lo + 6 - phase) / scTrack.speed - (scTrack.delayUse or 0)
-                    if dt > 0.002 and dt <= 2 then
-                        scTrack.scheduled, scTrack.schedBase = true, scTrack.base
-                        scTrack.pending = {
-                            at = os.clock() + dt, token = scPressToken,
-                            why = "trap timed",
-                            check = function()
-                                if scTrack.base == nil or scTrack.schedBase ~= scTrack.base then return false end
-                                if scTrack.fired or scTrack.missed then return false end
-                                local cur = scAngleRaw(scGui.line, scGui.off)
-                                if cur then
-                                    local ph = cur - scTrack.base
-                                    if ph < lo or ph > good then return false end
-                                    scStats.fireAt = cur
-                                end
-                                scTrack.fired = true
-                                return true
-                            end,
-                        }
-                    end
-                end
-            end
-        else
-            scStats.status = "trap: waiting for check"
-        end
-    else
-
-        local gr = scAngleRaw(scGui.goal, off)
-        if not gr then
-            scStats.status = "read miss"
-            return
-        end
-
-        local first = (scTrack.goal == nil)
-        local goalChanged = (not first) and (math.abs(gr - scTrack.goal) > 0.5)
-        local jumped = (prev ~= nil) and (lr < prev - 30)
-        if goalChanged or jumped then
-
-            if gr ~= 0 then scStats.checks = scStats.checks + 1 end
-            scResetCheck()
-            scTrack.speed, scTrack.sampleAt = nil, nil
-        end
-        scTrack.lr, scTrack.goal = lr, gr
-
-        scTrackSample(lr, d)
-
-        -- needle speed, so a humanized/planned delay can be taken off the trigger
-        if d ~= nil and math.abs(d) > 0.0005 then
-            local dt = now - (scTrack.sampleAt or (now - 0.016))
-            if dt > 0.002 and dt < 0.3 then
-                local sp = d / dt
-                if sp > 20 then
-                    scTrack.speed = scTrack.speed and (scTrack.speed * 0.6 + sp * 0.4) or sp
-                end
-            end
-            scTrack.sampleAt = now
-        end
-
-        local lo, hi, neutral = gr + 102, gr + 116, gr + 159
-        local leadAdj = math.clamp(tonumber(CFG.scLead) or 0, 0, (hi - lo) - 1)
-        local speed = scTrack.speed or 0
-        local want = scTrack.delay or 0
-        if speed > 20 then
-            local cap = (102 + leadAdj - 2) / speed
-            if cap > 0 and want > cap then want = cap end
-        end
-        scTrack.delayUse = want
-        local early = (speed > 20) and (want * speed) or 0
-        scStats.goal = gr
-        scStats.window = string.format("%.0f..%.0f", lo, hi)
-        if not scTrack.fired and not scTrack.missed then
-            if lr >= lo + leadAdj - early and lr <= hi then
-                fired, why = true, "perfect"
-            elseif CFG.scRescue and lr > hi and lr <= neutral then
-                fired, why = true, "neutral"
-                scStats.rescues = scStats.rescues + 1
-            elseif lr > neutral + 2 then
-                scTrack.missed = true
-                scStats.misses = scStats.misses + 1
-            end
-        end
-    end
-
-    scTrack.lr = lr
-
-    if fired then
-        scStats.fireAt = lr
-        if mode == "trap" and scTrack.base then
-            scSnapshot(scTrack.base)
-            scEvent(string.format("fire phase=%.1f base=%.1f lr=%.1f", lr - scTrack.base, scTrack.base, lr))
-        end
-        scTrack.fired = true
-        scTrack.rescued = (why == "neutral" or why == "trap good")
-        scPressPlanned(why, lr)
-    elseif scTrack.missed then
-        scStats.status = "window passed"
-    elseif scStats.moving then
-        scStats.status = "following"
-    else
-        scStats.status = "waiting for check"
-    end
-end
-
--- Runtime: generator ESP, bear-trap ESP, Auto Skill Check, and Fast Vault.
-local running = true
-local camera = Workspace.CurrentCamera
-local connection
-local renderMs, frameN, fpsMark, drawFps = 0, 0, os.clock(), 0
-local genDiscoverStamp, genDiscoverAt = nil, 0
-local worldMs = 0
-
-local function refreshWorld()
-    local started = os.clock()
-    local map = Workspace:FindFirstChild("Map")
-    local stamp = "none"
-
-    if map then
-        local addr, count = nil, nil
-        pcall(function() addr = map.Address end)
-        pcall(function() count = #map:GetChildren() end)
-        stamp = tostring(addr) .. ":" .. tostring(count)
-    end
-
-    if stamp ~= genStamp then
-        genStamp = stamp
-        genGeo = {}
-    end
-
-    if not CFG.gen then
-        genList = {}
-    elseif stamp ~= genDiscoverStamp or os.clock() >= genDiscoverAt then
-        genDiscoverStamp, genDiscoverAt = stamp, os.clock() + 30
-        local found = collectGens()
-        local kept = {}
-
-        for _, t in ipairs(found) do
-            local cached = t.key and genGeo[t.key] or nil
-            if cached == nil and t.key then
-                local center, hx, hy, hz, cf = measureModel(t.model)
-                cached = { center = center, hx = hx, hy = hy, hz = hz, cf = cf }
-                cached.right, cached.up, cached.back = basisFromCFrame(cf)
-                genGeo[t.key] = cached
-            end
-
-            if cached then
-                t.center, t.hx, t.hy, t.hz, t.cf = cached.center, cached.hx, cached.hy, cached.hz, cached.cf
-                t.right, t.up, t.back = cached.right, cached.up, cached.back
-                if t.center then kept[#kept + 1] = t end
-            elseif not t.key then
-                local center, hx, hy, hz, cf = measureModel(t.model)
-                if center then
-                    t.center, t.hx, t.hy, t.hz, t.cf = center, hx, hy, hz, cf
-                    t.right, t.up, t.back = basisFromCFrame(cf)
-                    kept[#kept + 1] = t
-                end
-            end
-        end
-
-        genList = kept
-        if not kept[1] then genDiscoverAt = os.clock() + 1.5 end
-    end
-
-    ensureSlots(genPool, math.min(#genList, CFG.genPool),
-        CFG.genThick, CFG.genText, CFG.genFill)
-
-    worldMs = worldMs * 0.8 + (os.clock() - started) * 1000 * 0.2
-end
-
-local function renderFrame()
-    if not running or _G.__GUILHERME_ZICA_LOAD ~= loadToken then return end
-
-    local now = os.clock()
-    if CFG.drawHz > 0 and now - (CFG.lastFrame or 0) < 1 / CFG.drawHz then return end
-    CFG.lastFrame = now
-    frameN = frameN + 1
-    if now - fpsMark >= 1 then
-        drawFps = frameN / (now - fpsMark)
-        frameN, fpsMark = 0, now
-    end
-
-    camera = Workspace.CurrentCamera or camera
-    if not camera then return end
-    local okc, ccf = pcall(function() return camera.CFrame end)
-    if not okc or not ccf then return end
-
-    local camPos = ccf.Position
-    camNow = camPos
-    local vp = camera.ViewportSize
-    if vp then camVpW, camVpH = vp.X, vp.Y end
-
-    if CFG.gen then
-        local ok, err = pcall(drawGens, camPos, now)
-        CFG.errGen = (not ok) and tostring(err) or nil
-    elseif genShown > 0 then
-        for i = 1, genShown do pcall(hideSlot, genPool[i]) end
-        genShown = 0
-    end
-
-    if CFG.trap then
-        local ok, err = pcall(drawTraps, camPos)
-        CFG.errTrap = (not ok) and tostring(err) or nil
-    elseif trapShown > 0 then
-        for i = 1, trapShown do pcall(hideSlot, trapPool[i]) end
-        trapShown = 0
-    end
-
-    renderMs = renderMs * 0.9 + (os.clock() - now) * 1000 * 0.1
-end
-
-connection = RunService.RenderStepped:Connect(function()
-    local ok, err = pcall(renderFrame)
-    if not ok then
-        CFG.renderErrors = (CFG.renderErrors or 0) + 1
-        CFG.lastRenderError = tostring(err)
-        -- Fail closed for this frame: hide active boxes instead of leaving
-        -- frozen drawings on screen. The next frame gets a clean retry.
-        for i = 1, genShown do pcall(hideSlot, genPool[i]) end
-        for i = 1, trapShown do pcall(hideSlot, trapPool[i]) end
-        genShown, trapShown = 0, 0
-    else
-        CFG.renderErrors = 0
-        CFG.lastRenderError = nil
-    end
-end)
-
-task.spawn(function()
-    while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
-        pcall(refreshWorld)
-        task.wait(1 / math.max(CFG.pollHz, 0.1))
-    end
-end)
-
-local genPollHz = 10
-task.spawn(function()
-    while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
-        if CFG.gen and genList[1] then
-            pcall(updateGenStates, genList)
-        end
-        task.wait(1 / genPollHz)
-    end
-end)
-
-task.spawn(function()
-    task.wait(0.35)
-    while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
-        if CFG.trap then
-            local ok, list = pcall(collectTraps)
-            if ok and list then
-                local slotOk = pcall(ensureSlots, trapPool,
-                    math.min(#list, CFG.trapPool), CFG.trapThick, CFG.trapText, CFG.trapFill)
-                if slotOk then trapList = list end
-            end
-            pcall(trapScanTrapped, os.clock())
-            pcall(updateTrapVictimLabels)
-        elseif #trapList > 0 then
-            trapList = {}
-        end
-        task.wait(1)
-    end
-end)
-
-task.spawn(function()
-    while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
-        local ok, err = pcall(scStep)
-        if not ok then
-            scReleaseInput()
-            vaultInputBusy = false
-            scTrack = { trace = {} }
-            scPressToken = scPressToken + 1
-            scGui.refreshAt = 0
-            scStats.errors = scStats.errors + 1
-            scStats.error, scStats.status = tostring(err), "read error, retrying"
-        end
-        task.wait(not ok and 0.1 or (CFG.sc and 1 / CFG.scHz or 0.1))
-    end
-    scReleaseInput()
-end)
-
--- Small API retained for status checks and clean shutdown; no menu or extra modules.
-local API = {}
-_G.__GUILHERME_ZICA = API
-_G.__SWANGY = API -- legacy API alias
-
-API.gen = {}
-function API.gen.SetEnabled(on)
-    local enabled = on and true or false
-    if enabled and not CFG.gen then genDiscoverAt = 0 end
-    CFG.gen = enabled
-    return CFG.gen
-end
-function API.gen.Toggle() return API.gen.SetEnabled(not CFG.gen) end
-function API.gen.SetRange(v) CFG.genRange = math.max(1, tonumber(v) or CFG.genRange) end
-function API.gen.GetCount() return #genList end
-
-API.trap = {}
-function API.trap.SetEnabled(on) CFG.trap = on and true or false; return CFG.trap end
-function API.trap.Toggle() return API.trap.SetEnabled(not CFG.trap) end
-function API.trap.SetRange(v) CFG.trapRange = math.max(1, tonumber(v) or CFG.trapRange) end
-function API.trap.GetCount() return #trapList end
-function API.trap.GetStates()
-    local out = {}
-    for i = 1, #trapList do
-        local t = trapList[i]
-        out[i] = { armed = t.armed, victim = trapVictim(t), pos = t.pos }
-    end
-    return out
-end
-
-API.sc = {}
-function API.sc.SetEnabled(on)
-    CFG.sc = on and true or false
-    if not CFG.sc then scReleaseInput(); scTrack = {} end
-    return CFG.sc
-end
-function API.sc.Toggle() return API.sc.SetEnabled(not CFG.sc) end
-function API.sc.SetLead(v) CFG.scLead = math.clamp(tonumber(v) or CFG.scLead, 0, 12) end
-function API.sc.SetRescue(on) CFG.scRescue = on and true or false; return CFG.scRescue end
-function API.sc.Stats()
-    local p = scTrack.pending
-    scStats.pending = p and string.format("+%.0fms", math.max(0, (p.at - os.clock()) * 1000)) or nil
-    return scStats
-end
-
--- Fast Vault: Matcha-controlled values, disabled by default.
--- Writes are event-driven: the GC scan happens on enable / refresh, and
--- applygc is called only when a setting changes or a fresh cache is found.
-local VK_SHIFT = 0x10
-local VAULT_DEFAULTS = {
-    DISTANCE = 3.5,
-    REPEAT_DISTANCE = 4,
-    DOT = 0.7071067811865476,
-    MIN_SPEED = 12.5,
-    ARRIVE_GRACE = 0.12,
-    SIDESTEP_TIME = 0.25,
-}
-local VAULT_KEYS = { "DISTANCE", "REPEAT_DISTANCE", "DOT", "MIN_SPEED", "ARRIVE_GRACE", "SIDESTEP_TIME" }
-local VAULT_KEY_SET = {}
-for i = 1, #VAULT_KEYS do VAULT_KEY_SET[VAULT_KEYS[i]] = true end
-
-local VAULT = {
-    enabled = false, always = false, sprint = false, debug = false,
-    dist = 1.5, rdist = 1.5, dot = 0.2, speed = 6.0, side = 0.6, grace = 0.3,
-}
-local VAULT_UI_VALUES = {
-    vm_enabled = false, vm_always = false, vm_sprint = false,
-    vm_dist = 1.5, vm_rdist = 1.5, vm_dot = 0.2,
-    vm_speed = 6.0, vm_side = 0.6, vm_grace = 0.3, vm_debug = false,
-}
-
-local vaultCache, vaultCounts, vaultVals = nil, {}, {}
-local vaultOriginal, vaultLastSent = {}, {}
-local vaultScanErr, vaultApplyErr, vaultSkipped = "", "", ""
-local vaultLastScan, vaultLastFullScan, vaultNextScanAt, vaultNextApplyAt = 0, 0, 0, 0
-local vaultWasEnabled, vaultSprintHeld = false, false
-local vaultRestorePending = false
-local vaultPartialScans = 0
-local vaultStatus, vaultStatusText = nil, ""
-
-local function vaultGetDesired()
-    if VAULT.always then
-        return {
-            DISTANCE = 0.1, REPEAT_DISTANCE = 0.1, DOT = -1,
-            MIN_SPEED = 0, ARRIVE_GRACE = 1, SIDESTEP_TIME = 5,
-        }
-    end
-    return {
-        DISTANCE = VAULT.dist, REPEAT_DISTANCE = VAULT.rdist, DOT = VAULT.dot,
-        MIN_SPEED = VAULT.speed, ARRIVE_GRACE = VAULT.grace, SIDESTEP_TIME = VAULT.side,
-    }
-end
-
-local function vaultScan(isRefresh)
-    local now = os.clock()
-    vaultLastScan = now
-
-    if type(getgc) ~= "function" then
-        vaultScanErr = "getgc unavailable"
-        vaultNextScanAt = now + (vaultCache and 30 or 1.5)
-        return false, false
-    end
-
-    local ok, result = pcall(getgc, VAULT_KEYS)
-    if not ok or type(result) ~= "table" then
-        vaultScanErr = tostring(result or "getgc returned no table")
-        vaultNextScanAt = now + (vaultCache and 30 or 1.5)
-        return false, false
-    end
-
-    local counts, values = {}, {}
-    local matched = 0
-    for _, entry in pairs(result) do
-        local okKey, key = pcall(function() return entry.key end)
-        if okKey and VAULT_KEY_SET[key] then
-            counts[key] = (counts[key] or 0) + 1
-            matched = matched + 1
-            if values[key] == nil then
-                local okValue, value = pcall(function() return entry.value end)
-                if okValue then values[key] = value end
-            end
-        end
-    end
-
-    if matched == 0 then
-        vaultScanErr = "no matching Fast Vault values found yet"
-        vaultNextScanAt = now + (vaultCache and 30 or 1.5)
-        return false, false
-    end
-
-    local complete = true
-    for i = 1, #VAULT_KEYS do
-        if (counts[VAULT_KEYS[i]] or 0) == 0 then complete = false break end
-    end
-
-    if not complete then
-        vaultScanErr = "partial Fast Vault values; waiting for all six keys"
-        vaultPartialScans = vaultPartialScans + 1
-        vaultNextScanAt = now + (vaultPartialScans <= 4 and 3 or 20)
-        return false, false
-    end
-
-    local hadCache = vaultCache ~= nil
-    vaultCache = result
-    vaultCounts, vaultVals = counts, values
-    vaultScanErr = ""
-
-    for key, value in pairs(values) do
-        -- Keep the first observed values as the true restore point. Do not
-        -- mistake our own modified values for the game's original settings.
-        if vaultOriginal[key] == nil then
-            if value ~= nil then
-                vaultOriginal[key] = value
-            else
-                vaultOriginal[key] = VAULT_DEFAULTS[key]
-            end
-        end
-    end
-
-    if not hadCache or isRefresh then
-        vaultLastSent = {}
-        vaultNextApplyAt = 0
-    end
-
-    vaultPartialScans = 0
-    vaultLastFullScan = now
-    -- Do not run another full GC scan every minute during gameplay. The
-    -- successful cache remains in use until the script is reloaded.
-    vaultNextScanAt = math.huge
-    return true, true
-end
-
-local function vaultSend(values, force)
-    if not vaultCache or type(applygc) ~= "function" then
-        if type(applygc) ~= "function" then vaultApplyErr = "applygc unavailable" end
-        return false
-    end
-
-    local send, skipped = {}, {}
-    for i = 1, #VAULT_KEYS do
-        local key = VAULT_KEYS[i]
-        local value = values[key]
-        local found = vaultCounts[key] or 0
-        if found == 0 then
-            skipped[#skipped + 1] = key .. "(none)"
-        elseif value ~= nil and (force or vaultLastSent[key] ~= value) then
-            send[key] = value
-        end
-    end
-    vaultSkipped = table.concat(skipped, " ")
-
-    if next(send) == nil then return true end
-    local ok, result = pcall(applygc, vaultCache, send)
-    if ok and result ~= false then
-        vaultApplyErr = ""
-        for key, value in pairs(send) do
-            vaultLastSent[key] = value
-            vaultVals[key] = value
-        end
-        vaultNextApplyAt = 0
-        return true
-    end
-
-    vaultApplyErr = ok and "applygc returned false" or tostring(result)
-    vaultNextApplyAt = os.clock() + 3
-    return false
-end
-
-local function vaultFmt(value)
-    if type(value) == "number" then return string.format("%.2f", value) end
-    if value == nil then return "?" end
-    return tostring(value)
-end
-
-local function vaultUpdateStatus()
-    if not VAULT.debug or not VAULT.enabled then
-        if vaultStatus then pcall(function() vaultStatus.Visible = false end) end
-        return
-    end
-
-    if not vaultStatus then
-        local ok, drawing = pcall(Drawing.new, "Text")
-        if ok and drawing then
-            vaultStatus = drawing
-            pcall(function()
-                vaultStatus.Outline = true
-                vaultStatus.Center = false
-                vaultStatus.Color = Color3.fromRGB(255, 255, 255)
-                vaultStatus.Position = Vector2.new(20, 300)
-                vaultStatus.Transparency = 1
-                vaultStatus.Visible = false
-            end)
-        end
-    end
-    if not vaultStatus then return end
-
-    local parts = {}
-    for i = 1, #VAULT_KEYS do
-        local key = VAULT_KEYS[i]
-        parts[#parts + 1] = key .. " x" .. (vaultCounts[key] or 0) .. "=" .. vaultFmt(vaultVals[key])
-    end
-    local line = table.concat(parts, "\n")
-    if not vaultCache then line = "GC scan: " .. vaultScanErr end
-    if vaultSkipped ~= "" then line = line .. "\nskipped: " .. vaultSkipped end
-    if vaultApplyErr ~= "" then line = line .. "\napplygc: " .. vaultApplyErr end
-
-    if line ~= vaultStatusText then
-        vaultStatusText = line
-        pcall(function() vaultStatus.Text = line end)
-    end
-    pcall(function() vaultStatus.Visible = true end)
-end
-
-vaultReleaseSprint = function()
-    if vaultSprintHeld then
-        pcall(keyrelease, VK_SHIFT)
-        vaultSprintHeld = false
-    end
-end
-
-local function vaultRestoreOriginal()
-    if not vaultCache then return false end
-    local restore = {}
-    for i = 1, #VAULT_KEYS do
-        local key = VAULT_KEYS[i]
-        if (vaultCounts[key] or 0) > 0 then
-            -- Restore the exact values observed before our first modification;
-            -- use the supplied defaults only as a fallback for missing snapshots.
-            restore[key] = vaultOriginal[key]
-            if restore[key] == nil then restore[key] = VAULT_DEFAULTS[key] end
-        end
-    end
-    local restored = vaultSend(restore, true)
-    if restored then vaultLastSent = {} end
-    return restored
-end
-
-local function vaultShutdown()
-    if VAULT.enabled or vaultWasEnabled or vaultRestorePending then
-        pcall(vaultRestoreOriginal)
-    end
-    vaultRestorePending = false
-    vaultWasEnabled = false
-    VAULT.enabled = false
-    vaultReleaseSprint()
-    if vaultStatus then
-        pcall(function() vaultStatus.Visible = false end)
-        pcall(function() vaultStatus:Remove() end)
-        vaultStatus = nil
-        vaultStatusText = ""
-    end
-end
-
--- One serialized worker owns all Fast Vault GC writes and Sprint key state.
--- No 5-second forced reapply: that repeated write was a likely source of
--- interference with the game's own vault logic.
-task.spawn(function()
-    while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
-        task.wait(0.25)
-        local ok, err = pcall(function()
-            local now = os.clock()
-            local enabled = VAULT.enabled == true
-
-            if enabled then
-                if vaultRestorePending then
-                    -- A rapid off/on toggle cancels the pending restore and
-                    -- reapplies the selected Fast Vault values instead.
-                    vaultRestorePending = false
-                    vaultLastSent = {}
-                    vaultNextApplyAt = 0
-                end
-                if now >= vaultNextScanAt then
-                    local isRefresh = vaultCache ~= nil and (now - vaultLastFullScan) >= 60
-                    vaultScan(isRefresh)
-                end
-
-                if vaultCache and now >= vaultNextApplyAt then
-                    vaultSend(vaultGetDesired(), false)
-                end
-            elseif vaultWasEnabled then
-                vaultRestorePending = true
-                vaultReleaseSprint()
-            end
-
-            if not enabled and vaultRestorePending and now >= vaultNextApplyAt then
-                if vaultRestoreOriginal() then
-                    vaultRestorePending = false
-                end
-            end
-            vaultWasEnabled = enabled
-
-            local active = false
-            if type(isrbxactive) == "function" then
-                local activeOk, activeValue = pcall(isrbxactive)
-                active = activeOk and activeValue == true
-            end
-            local wantSprint = enabled and VAULT.sprint and active
-                and not vaultInputBusy and now >= vaultBlockSprintUntil
-            if wantSprint and not vaultSprintHeld then
-                local pressOk, pressResult = pcall(keypress, VK_SHIFT)
-                if pressOk and pressResult ~= false then
-                    vaultSprintHeld = true
-                end
-            elseif not wantSprint then
-                vaultReleaseSprint()
-            end
-
-            vaultUpdateStatus()
+    local function Picker2(section, id1, colour1, id2, colour2)
+        Widget(section, "ColorPicker2", id1, id1, {colour1.R, colour1.G, colour1.B, 1}, id2, {colour2.R, colour2.G, colour2.B, 1}, function(first, _, second)
+            local picked1, picked2 = AsColour(first), AsColour(second)
+            if picked1 then colours[id1](picked1) end
+            if picked2 then colours[id2](picked2) end
         end)
-        if not ok then
-            vaultApplyErr = tostring(err)
-            vaultNextApplyAt = os.clock() + 1
-            vaultReleaseSprint()
-            if type(warn) == "function" then warn("[VaultMod] " .. tostring(err)) end
-        end
-    end
-    vaultShutdown()
-end)
-
-function API.unload()
-    if not running then return end
-    running = false
-    scReleaseInput()
-    pcall(vaultShutdown)
-    if API.matchaCleanup then pcall(API.matchaCleanup) end
-    if connection then pcall(function() connection:Disconnect() end); connection = nil end
-    for i = 1, #genPool do removeSlot(genPool[i]) end
-    for i = 1, #trapPool do removeSlot(trapPool[i]) end
-    genPool, trapPool = {}, {}
-    if _G.__GUILHERME_ZICA == API then _G.__GUILHERME_ZICA = nil end
-    if _G.__SWANGY == API then _G.__SWANGY = nil end
-    if _G.__GUILHERME_ZICA_LOAD == loadToken then _G.__GUILHERME_ZICA_LOAD = nil end
-    if _G.__SWANGY_LOAD == loadToken then _G.__SWANGY_LOAD = nil end
-end
-API.stop = API.unload
-
-
--- Matcha UI: the only control surface for the retained features.
--- Uses the documented UI.AddTab / Section / Toggle / SliderInt API.
-local function buildMatchaUI()
-    local M = _G.UI
-    if type(M) ~= "table" or type(M.AddTab) ~= "function" then
-        if type(warn) == "function" then
-            warn("[GUILHERME ZICA] Matcha UI API unavailable; feature loops remain idle until toggled by API")
-        end
-        return false
     end
 
-    UI = M
-    local TAB_NAME = "GUILHERME ZICA"
-    local values = {
-        sw_gen = CFG.gen,
-        sw_trap = CFG.trap,
-        sc_on = CFG.sc,
-        sc_rescue = CFG.scRescue,
-        sc_hum = CFG.scHum,
-        sc_hum_min = CFG.scHumMin,
-        sc_hum_max = CFG.scHumMax,
-        sc_react = CFG.scReact,
-        sc_delay = CFG.scDelay,
-        gen_range = CFG.genRange,
-        trap_range = CFG.trapRange,
-        gen_fill = CFG.genFill,
-        trap_fill = CFG.trapFill,
-        sc_lead = CFG.scLead,
-        vm_enabled = VAULT_UI_VALUES.vm_enabled,
-        vm_always = VAULT_UI_VALUES.vm_always,
-        vm_sprint = VAULT_UI_VALUES.vm_sprint,
-        vm_dist = VAULT_UI_VALUES.vm_dist,
-        vm_rdist = VAULT_UI_VALUES.vm_rdist,
-        vm_dot = VAULT_UI_VALUES.vm_dot,
-        vm_speed = VAULT_UI_VALUES.vm_speed,
-        vm_side = VAULT_UI_VALUES.vm_side,
-        vm_grace = VAULT_UI_VALUES.vm_grace,
-        vm_debug = VAULT_UI_VALUES.vm_debug,
-    }
-
-    local setters = {
-        sw_gen = function(v) API.gen.SetEnabled(v == true) end,
-        sw_trap = function(v) API.trap.SetEnabled(v == true) end,
-        sc_on = function(v) API.sc.SetEnabled(v == true) end,
-        sc_rescue = function(v) API.sc.SetRescue(v == true) end,
-        sc_hum = function(v) CFG.scHum = v == true end,
-        sc_hum_min = function(v)
-            local n = math.clamp(tonumber(v) or CFG.scHumMin, 0, 500)
-            if n > CFG.scHumMax then n = CFG.scHumMax end
-            CFG.scHumMin = n
-            if type(M.SetValue) == "function" then pcall(M.SetValue, "sc_hum_min", n) end
-        end,
-        sc_hum_max = function(v)
-            local n = math.clamp(tonumber(v) or CFG.scHumMax, 0, 500)
-            if n < CFG.scHumMin then n = CFG.scHumMin end
-            CFG.scHumMax = n
-            if type(M.SetValue) == "function" then pcall(M.SetValue, "sc_hum_max", n) end
-        end,
-        sc_react = function(v) CFG.scReact = math.clamp(tonumber(v) or 0, 0, 300) end,
-        sc_delay = function(v) CFG.scDelay = math.clamp(tonumber(v) or 0, 0, 300) end,
-        gen_range = function(v) API.gen.SetRange(v) end,
-        trap_range = function(v) API.trap.SetRange(v) end,
-        gen_fill = function(v) CFG.genFill = v == true end,
-        trap_fill = function(v) CFG.trapFill = v == true end,
-        sc_lead = function(v) API.sc.SetLead(v) end,
-        vm_enabled = function(v) VAULT.enabled = v == true end,
-        vm_always = function(v) VAULT.always = v == true end,
-        vm_sprint = function(v) VAULT.sprint = v == true end,
-        vm_dist = function(v) VAULT.dist = math.clamp(tonumber(v) or VAULT.dist, 0.1, 3.5) end,
-        vm_rdist = function(v) VAULT.rdist = math.clamp(tonumber(v) or VAULT.rdist, 0.1, 4.0) end,
-        vm_dot = function(v) VAULT.dot = math.clamp(tonumber(v) or VAULT.dot, -1.0, 0.71) end,
-        vm_speed = function(v) VAULT.speed = math.clamp(tonumber(v) or VAULT.speed, 0.0, 12.5) end,
-        vm_side = function(v) VAULT.side = math.clamp(tonumber(v) or VAULT.side, 0.25, 5.0) end,
-        vm_grace = function(v) VAULT.grace = math.clamp(tonumber(v) or VAULT.grace, 0.12, 1.0) end,
-        vm_debug = function(v) VAULT.debug = v == true end,
-    }
-
-    local function addSection(tab, name, side)
-        if not tab or type(tab.Section) ~= "function" then return nil end
+    local function Section(tab, name, side)
         local ok, section = pcall(tab.Section, tab, name, side)
-        return ok and section or nil
+        if not ok then
+            widgetErrors[name] = widgetErrors[name] or tostring(section)
+            return nil
+        end
+        return section
     end
 
-    local function addWidget(section, method, ...)
-        if not section or type(section[method]) ~= "function" then return nil end
-        local ok, result = pcall(section[method], section, ...)
-        return ok and result or nil
+    local function Toggle(section, id, label)
+        Widget(section, "Toggle", id, id, label, defaults[id])
     end
 
-    local function addToggle(section, id, label)
-        addWidget(section, "Toggle", id, label, values[id], function(value)
-            if type(value) ~= "boolean" then return end
-            values[id] = value
-            if string.sub(id, 1, 3) == "vm_" then VAULT_UI_VALUES[id] = value end
-            local apply = setters[id]
-            if apply then pcall(apply, value) end
-        end)
-    end
+    pcall(UI.RemoveTab, tabName)
+    UI.AddTab(tabName, function(tab)
+        local esp = Section(tab, "ESP", "Left")
+        Toggle(esp, "vd_gen", "Generator ESP")
+        Picker2(esp, "vd_gen_col", generatorColor, "vd_gen_done", completedColor)
+        Toggle(esp, "vd_kicked", "Kicked generator color")
+        Picker(esp, "vd_kicked_col", regressingColor)
+        Toggle(esp, "vd_pal", "Pallet ESP")
+        Picker(esp, "vd_pal_col", palletColor)
+        Toggle(esp, "vd_win", "Window ESP")
+        Picker(esp, "vd_win_col", windowColor)
+        Toggle(esp, "vd_trap", "Bear trap ESP")
+        Picker(esp, "vd_trap_col", trapColor)
+        Toggle(esp, "vd_zombie", "Cure zombie ESP")
+        Picker(esp, "vd_zombie_col", zombieColor)
+        Toggle(esp, "vd_hud", "Info HUD")
 
-    local function addSlider(section, id, label, minimum, maximum)
-        addWidget(section, "SliderInt", id, label, minimum, maximum, values[id], function(value)
-            if type(value) ~= "number" then return end
-            values[id] = value
-            local apply = setters[id]
-            if apply then pcall(apply, value) end
-        end)
-    end
+        local highlighting = Section(tab, "Highlighting", "Left")
+        Widget(highlighting, "SliderInt", "vd_hl_dist", "vd_hl_dist", "Highlight render distance", 25, 1000, defaults.vd_hl_dist)
+        Toggle(highlighting, "vd_hl_fill", "Highlight fill")
+        Toggle(highlighting, "vd_hl_outline", "Highlight outline")
 
-    local function addFloatSlider(section, id, label, minimum, maximum, format)
-        -- Matcha's SliderFloat signature follows the supplied Vault snippet:
-        -- id, label, min, max, initial value, format. The GetValue restore
-        -- loop below reads and applies the current value after widget creation.
-        addWidget(section, "SliderFloat", id, label, minimum, maximum, values[id], format or "%.2f")
-    end
+        local auto = Section(tab, "Automation", "Right")
+        Toggle(auto, "vd_skill", "Auto skill check")
+        Toggle(auto, "vd_auto_pallet", "Auto pallet")
+        Toggle(auto, "vd_crouch", "Crouch under Abysswalker waves")
 
-    local ok, err = pcall(M.AddTab, TAB_NAME, function(tab)
-        local esp = addSection(tab, "ESP", "Left")
-        addToggle(esp, "sw_gen", "Generator ESP")
-        addSlider(esp, "gen_range", "Generator range", 50, 10000)
-        addToggle(esp, "gen_fill", "Generator fill (higher GPU/CPU cost)")
-        addToggle(esp, "sw_trap", "Bear Trap ESP")
-        addSlider(esp, "trap_range", "Bear Trap range", 50, 10000)
-        addToggle(esp, "trap_fill", "Bear Trap fill (higher GPU/CPU cost)")
-
-        local skill = addSection(tab, "Auto Skill Check — Gen + Butcher Trap", "Right")
-        addToggle(skill, "sc_on", "Auto Skill Check (automatic mode)")
-        addWidget(skill, "Text", "Detects generator and butcher-trap checks automatically; no mode switch is needed.")
-        addToggle(skill, "sc_rescue", "Neutral-window rescue timing")
-        addSlider(skill, "sc_lead", "Early timing", 0, 12)
-        addToggle(skill, "sc_hum", "Humanized delay")
-        addSlider(skill, "sc_hum_min", "Humanize minimum ms", 0, 500)
-        addSlider(skill, "sc_hum_max", "Humanize maximum ms", 0, 500)
-        addSlider(skill, "sc_react", "Reaction delay ms", 0, 300)
-        addSlider(skill, "sc_delay", "Click delay ms", 0, 300)
-
-        local vault = addSection(tab, "Fast Vault", "Right")
-        addToggle(vault, "vm_enabled", "Enable Fast Vault")
-        addToggle(vault, "vm_always", "Always Fast Vault (max preset)")
-        addToggle(vault, "vm_sprint", "Hold Shift (sprint required)")
-        addWidget(vault, "Text", "Manual values are used when the max preset is off.")
-        addFloatSlider(vault, "vm_dist", "Run-up Distance", 0.1, 3.5, "%.2f")
-        addFloatSlider(vault, "vm_rdist", "Repeat Run-up", 0.1, 4.0, "%.2f")
-        addFloatSlider(vault, "vm_dot", "Angle Strictness", -1.0, 0.71, "%.2f")
-        addFloatSlider(vault, "vm_speed", "Min Pace", 0.0, 12.5, "%.1f")
-        addFloatSlider(vault, "vm_side", "Sidestep Time", 0.25, 5.0, "%.2f")
-        addFloatSlider(vault, "vm_grace", "Arrive Grace", 0.12, 1.0, "%.2f")
-        addToggle(vault, "vm_debug", "Show Debug Line")
-        addWidget(vault, "Text", "Turning Fast Vault off restores the values captured before the first change.")
-
-        local scope = addSection(tab, "Original feature scope", "Left")
-        addWidget(scope, "Text", "Auto Skill Check covers generator checks and butcher-trap checks. Neutral rescue is a timing fallback, not a separate player-rescue action.")
-        addWidget(scope, "Text", "The original source has no dedicated automatic generator-repair or player-healing routine.")
-        addWidget(scope, "Text", "The separate floating HUD has been removed; controls stay in this Matcha tab.")
-        addWidget(scope, "Button", "Unload GUILHERME ZICA", function()
-            pcall(API.unload)
-        end)
+        local vault = Section(tab, "Fast Vault", "Right")
+        Toggle(vault, "vd_fv_enabled", "Enable Fast Vault")
+        Widget(vault, "SliderInt", "vd_fv_distance", "vd_fv_distance", "Max approach distance", 0, 4, defaults.vd_fv_distance)
+        Widget(vault, "SliderInt", "vd_fv_angle", "vd_fv_angle", "Approach angle", 0, 180, defaults.vd_fv_angle)
+        Widget(vault, "SliderInt", "vd_fv_speed", "vd_fv_speed", "Minimum approach speed", 0, 24, defaults.vd_fv_speed)
     end)
 
-    if not ok then
-        if type(warn) == "function" then warn("[GUILHERME ZICA] Matcha tab creation failed: " .. tostring(err)) end
-        return false
-    end
-
-    API.matchaCleanup = function()
-        if type(M.RemoveTab) == "function" then pcall(M.RemoveTab, TAB_NAME) end
-    end
-
-    -- Restore Matcha's saved widget values after the widgets have been registered.
-    -- This keeps the menu state and the running feature state synchronized.
-    if type(M.GetValue) == "function" then
-        task.spawn(function()
-            task.wait(0.25)
-            while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
-                for id, apply in pairs(setters) do
-                    local okValue, value = pcall(M.GetValue, id)
-                    if okValue and value ~= nil and type(value) == type(values[id]) then
-                        if values[id] ~= value then
-                            values[id] = value
-                            if string.sub(id, 1, 3) == "vm_" then VAULT_UI_VALUES[id] = value end
-                            pcall(apply, value)
-                        end
+    task.spawn(function()
+        local last = {}
+        while Running() do
+            for key, err in widgetErrors do
+                if not reported[key] then
+                    reported[key] = true
+                    print("[MatchaVD] menu widget " .. key .. " failed: " .. err)
+                end
+            end
+            for id, set in apply do
+                local ok, value = pcall(UI.GetValue, id)
+                if not ok or value == nil then value = defaults[id] end
+                if last[id] ~= value then
+                    last[id] = value
+                    set(value)
+                end
+            end
+            for id, set in colours do
+                local ok, value = pcall(UI.GetValue, id)
+                local colour = ok and AsColour(value)
+                if colour then
+                    local key = string.format("%.3f %.3f %.3f", colour.R, colour.G, colour.B)
+                    if last[id] ~= key then
+                        last[id] = key
+                        set(colour)
                     end
                 end
-                task.wait(0.2)
             end
-        end)
-    end
-
-    return true
-end
-
-local uiOK = buildMatchaUI()
-if not uiOK then
-    -- Matcha can finish exposing its UI library after the game services attach.
-    -- Retry without blocking the script or creating a second tab after success.
-    task.spawn(function()
-        while running and _G.__GUILHERME_ZICA_LOAD == loadToken do
-            task.wait(0.5)
-            if type(_G.UI) == "table" and type(_G.UI.AddTab) == "function" then
-                if buildMatchaUI() then return end
-            end
+            task.wait(.1)
         end
     end)
 end
-API.ui = UI
 
-_G.__GUILHERME_ZICA = API
-_G.__SWANGY = API -- legacy API alias for older companion snippets
-return API
+_G.MatchaVDConnection = RunService.RenderStepped:Connect(function()
+    if Running() then Render() end
+end)
+
+print("[MatchaVD] loaded")
+
+else
+    print("Not in Violence District")
+end
